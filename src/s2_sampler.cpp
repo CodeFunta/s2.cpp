@@ -2,6 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
+#include <limits>
 
 namespace s2 {
 
@@ -45,14 +46,19 @@ int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerPara
     std::vector<std::pair<float, int32_t>> items;
     items.reserve(vocab_size);
     for (int32_t i = 0; i < vocab_size; ++i) {
-        items.push_back({logits[i], i});
+        // Masked vocabulary entries have zero probability. Do not sort or
+        // exponentiate them for each semantic token.
+        if (logits[i] != -std::numeric_limits<float>::infinity())
+            items.push_back({logits[i], i});
     }
+    if (items.empty()) return 0;
 
     std::sort(items.begin(), items.end(), [](const auto & a, const auto & b) {
         return a.first > b.first;
     });
 
-    const int32_t k = params.top_k > 0 ? std::min(params.top_k, vocab_size) : vocab_size;
+    const int32_t candidates = static_cast<int32_t>(items.size());
+    const int32_t k = params.top_k > 0 ? std::min(params.top_k, candidates) : candidates;
     const float top_p = std::clamp(params.top_p, 0.0f, 1.0f);
     const std::vector<float> sorted_probs = softmax_from_sorted_logits(items);
 

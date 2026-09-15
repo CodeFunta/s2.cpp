@@ -149,6 +149,12 @@ private:
     std::vector<uint8_t> ctx_buf_;
     size_t         fast_ctx_size_ = 0;
     std::vector<uint8_t> fast_ctx_buf_;
+    ggml_context * fast_kv_ctx_ = nullptr;
+    ggml_backend_buffer_t fast_kv_buf_ = nullptr;
+    ggml_tensor * fast_k_ = nullptr;
+    ggml_tensor * fast_v_ = nullptr;
+    std::vector<float> fast_hidden_;
+    std::vector<int32_t> fast_prefix_;
 
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
 

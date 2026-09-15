@@ -11,6 +11,63 @@
 
 ---
 
+## Local Metal streaming fork
+
+The `metal-streaming` branch adds Metal causal left padding, fused/GQA attention,
+incremental fast-codebook KV caching, and a stateful causal audio decoder.
+Streaming processes only new codes: attention KV and convolution history are
+retained per layer, with bounded storage rather than repeated prefix decoding.
+Metal transposed convolutions use cached weight reordering plus GEMM/overlap-add;
+the generic Metal operator also has a SIMD channel reduction.
+
+Quantized Metal batch kernels can change arithmetic with batch size. This fork
+honors explicit `GGML_PREC_F32` using the consistent matrix-vector path, which
+the fast decoder requests. The cache regression compares incremental logits
+with clean full-prefix recomputation, including changed inputs and reset.
+
+Build and run the targeted Metal numerical checks:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DS2_METAL=ON \
+  -DS2_BUILD_SHARED_LIBRARIES=ON -DS2_BUILD_TESTS=ON \
+  -DS2_TEST_MODEL=/absolute/path/to/s2-pro-q4_k_m.gguf
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+All ggml changes are reproducible patches under `patches/`, applied by the
+existing CMake patch target. Do not distribute only a dirty submodule checkout.
+Without `S2_TEST_MODEL`, the model-dependent binaries build but only the
+model-independent Metal padding/convolution test is registered with CTest.
+
+For actual frame streaming, select `--metal --gpu-layers -1
+--codec-follow-backend` and use `stream=true`, `chunked=true`,
+`output_format="pcm_s16le"`, `segment_sentences=false`,
+`stream_start_buffer_ms=0`, and `stream_holdback_frames=0`.
+The default four-frame cadence prioritizes first audio; eight frames can improve
+sustained throughput. `codec_decode_context_frames` now affects offline/windowed
+decoding only, not the stateful streaming history.
+
+`AudioCodec::decode_stream` consumes codebook-major **new** frames and returns
+only their PCM. `clear_decode_cache` starts a new stream; immutable reordered
+weights remain reusable until model reload. Pipeline request scope resets history
+on success, cancellation, and failure. The decoder remains serial per instance.
+
+Inline cues are passed unchanged to the model, not parsed into a fixed enum:
+`[laughing] That was funny!`, `[sad] I understand.`, or
+`[whisper in small voice] A quiet secret.`
+Place a short free-form cue immediately before the intended phrase. See the
+[S2 Pro model card](https://huggingface.co/fishaudio/s2-pro) and
+[official inline-tag guide](https://fish.audio/blog/how-to-use-inline-tags-in-fish-audio-s2/).
+Successful synthesis does not guarantee a particular audible emotion or laugh.
+
+The new path has been exercised on M3 Ultra with Q4_K_M and the Jarvis reference.
+Codec chunk/full comparisons tolerate bounded floating-point drift, not bitwise
+waveform identity. Other backends and model variants need separate validation;
+latency, perceptual voice fidelity, and expression quality are not universal guarantees.
+
+---
+
 ## What this is
 
 This repository contains:
@@ -174,8 +231,8 @@ All opaque objects follow an `Alloc` / `Release` pattern:
 | Field | Default | Description |
 |---|---|---|
 | `stream_decode_stride_frames` | `0` (auto) | Decode cadence in frames |
-| `stream_holdback_frames` | `-1` (auto) | Trailing frames buffered before emission |
-| `codec_decode_context_frames` | `-1` (auto) | Codec decode history window; lower uses less VRAM |
+| `stream_holdback_frames` | `-1` (auto = `0`) | Explicit trailing-frame delivery delay; not decoder context |
+| `codec_decode_context_frames` | `-1` (auto) | Offline decode history window; stateful streaming retains its own exact layer history |
 | `low_latency` | `0` | Aggressive live preset (`stride=1`, `holdback=0`) |
 | `segment_sentences` | `0` | Sentence-by-sentence synthesis mode |
 | `sentence_pause_ms` | `180` | Silence gap between sentences |
@@ -367,7 +424,7 @@ For stability, embedding lookups remain on CPU in the current CUDA hybrid path, 
 | `--trim-silence` / `--no-trim-silence` | `trim` disabled | Enable or disable trailing silence trimming on the saved WAV |
 | `--normalize` / `--no-normalize` | `normalize` disabled | Enable or disable peak normalization to `0.95` on the saved WAV |
 | `--codec-auto` / `--codec-follow-backend` / `--codec-cpu` | `--codec-auto` | `--codec-auto` benchmarks codec backends and keeps the fastest; `--codec-follow-backend` lets the codec follow the selected GPU backend; `--codec-cpu` keeps codec on CPU. If codec GPU init or allocation fails, the runtime falls back to CPU |
-| `--codec-context-frames <n>` | `auto` | Override codec decode history window. Lower values use less VRAM but may reduce quality |
+| `--codec-context-frames <n>` | `auto` | Override offline/windowed codec history. Does not truncate stateful streaming history |
 | `--stream-file` | — | Write the WAV through the exact streaming path instead of the final one-shot save |
 | `--stream-decode-stride N` | `0` | Decode cadence in frames. `0` = auto (`4` for server streaming, `16` for `--stream-file` and offline synthesis) |
 | `--log-level LEVEL` | `info` | Runtime log verbosity: `error`, `warn`, `info`, or `debug` |
@@ -410,7 +467,7 @@ Returns a finalized `audio/wav` download by default.
 - `voice=hope` reuses `./voices/hope.s2voice` by default. You can also pass `voice=voices/hope.s2voice` to target a specific file directly.
 - `params.output_format="pcm_s16le"` with `params.stream=true`: skips the WAV header entirely and returns raw PCM16 mono bytes. This is the preferred transport for a browser/app that wants to maintain a dynamic playback buffer instead of saving a file. The server includes `X-Audio-Sample-Rate`, `X-Audio-Channels`, and `X-Audio-Encoding` headers for convenience; clients should use those headers instead of assuming a fixed sample rate.
 - `params.low_latency=true`: applies an aggressive live preset for weak machines by defaulting to `stream_decode_stride_frames=1` and `stream_holdback_frames=0`, so playback can start as soon as samples exist.
-- `params.stream_holdback_frames=N`: controls how many trailing codec frames stay buffered before they are emitted. Lower values reduce startup latency; higher values keep chunk boundaries more stable. `0` is the lowest-latency option, while the default auto mode uses the codec's full history window.
+- `params.stream_holdback_frames=N`: delays delivery by `N` code frames. The stateful causal decoder retains its own history, so auto and `0` add no holdback; increasing this value is not required for boundary context.
 - `params.stream_start_buffer_ms=N`: for chunked HTTP streaming, waits until roughly `N` milliseconds of PCM are queued before the server starts sending bytes. This is the best option when you want natural playback and can tolerate a short startup delay.
 - `params.segment_sentences=true`: switches the server from exact frame streaming to sentence-by-sentence synthesis. This is usually the best mode for slower machines because each sentence is generated as a whole, then queued for playback.
 - `params.sentence_pause_ms=N`: inserts a fixed silence gap between synthesized sentences when `segment_sentences=true`.
@@ -559,7 +616,7 @@ Voice quality and amplitude tend to degrade after ~800 tokens (~37 s of audio). 
 
 ## Known limitations (alpha)
 
-- Exact streaming still re-decodes the confirmed prefix, so streaming latency and CPU time remain structurally high until the codec becomes incremental/stateful. `stream_holdback_frames` can reduce perceived startup delay, but too-low values may add audible boundary artifacts
+- Stateful streaming retains bounded per-layer history instead of re-decoding prefixes. Chunk sizes trade first-audio latency against throughput; a low RTF or a successful numerical check alone does not establish perceptual quality
 - No batch inference
 - No HTTP request queue: the server accepts one active `/generate` synthesis and returns `503` for concurrent requests
 - Voice cloning quality depends heavily on reference audio length and SNR

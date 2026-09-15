@@ -1,0 +1,27 @@
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2048,10 +2048,14 @@
+     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
+     // to the matrix-vector kernel
+     const int ne11_mm_min = 8;
++    // Quantized batched kernels can change arithmetic with batch size.
++    // Honor explicit F32 precision with the shape-consistent matrix-vector path.
++    const bool precise_quantized = ggml_is_quantized(op->src[0]->type) &&
++        ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
+ 
+     // first try to use small-batch mat-mv kernels
+     // these should be efficient for BS [2, ~8]
+-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
++    if (!precise_quantized && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+         (
+          (
+           (
+@@ -2151,7 +2155,7 @@
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
+     } else if (
+-        !ggml_is_transposed(op->src[0]) &&
++        !precise_quantized && !ggml_is_transposed(op->src[0]) &&
+         !ggml_is_transposed(op->src[1]) &&
+         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
+         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel

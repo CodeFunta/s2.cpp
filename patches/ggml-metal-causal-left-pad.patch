@@ -1,0 +1,46 @@
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1007,6 +1007,7 @@
+     uint64_t nb1;
+     uint64_t nb2;
+     uint64_t nb3;
++    int32_t  p0;
+ } ggml_metal_kargs_pad;
+ 
+ typedef struct {
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1134,7 +1134,7 @@
+                 return false;
+             }
+ 
+-            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
++            return (ggml_get_op_params_i32(op, 2) == 0) &&
+                    (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
+         case GGML_OP_PAD_REFLECT_1D:
+         case GGML_OP_TIMESTEP_EMBEDDING:
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4034,7 +4034,8 @@
+         /*.nb0  =*/ nb0,
+         /*.nb1  =*/ nb1,
+         /*.nb2  =*/ nb2,
+-        /*.nb3  =*/ nb3
++        /*.nb3  =*/ nb3,
++        /*.p0   =*/ ggml_get_op_params_i32(op, 0)
+     };
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -5322,8 +5322,8 @@
+ 
+     if (i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
+         for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+-            if (i0 < args.ne00) {
+-                dst_ptr[i0] = src0_ptr[i0];
++            if (i0 >= args.p0 && i0 < args.p0 + args.ne00) {
++                dst_ptr[i0] = src0_ptr[i0 - args.p0];
+             } else {
+                 dst_ptr[i0] = 0.0f;
+             }

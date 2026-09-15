@@ -1,0 +1,78 @@
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -4842,7 +4842,8 @@
+         device const float * src1,
+         device        char * dst,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+-        uint3    tgpg[[threadgroups_per_grid]]);
++        uint3    tgpg[[threadgroups_per_grid]],
++        ushort lane[[thread_index_in_simdgroup]]);
+ 
+ template <typename T>
+ kernel void kernel_conv_transpose_1d(
+@@ -4851,7 +4852,8 @@
+         device const float * src1,
+         device        char * dst,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+-        uint3   tgpg[[threadgroups_per_grid]]) {
++        uint3   tgpg[[threadgroups_per_grid]],
++        ushort lane[[thread_index_in_simdgroup]]) {
+ 
+     // For output position j on the time axis, only input positions
+     //   i such that i*s0 <= j < i*s0 + K
+@@ -4873,7 +4875,7 @@
+ 
+     float v = 0.0f;
+     if (i_min <= i_max) {
+-        for (int64_t c = 0; c < args.IC; c++) {
++        for (int64_t c = lane; c < args.IC; c += 32) {
+             const int32_t kernel_offset = c * tgpg[1] * K + K * tgpig[1];
+             const int32_t input_offset  = c * IL;
+ 
+@@ -4883,9 +4885,11 @@
+         }
+     }
+ 
+-    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
+-
+-    dst_ptr[0] = v;
++    v = simd_sum(v);
++    if (lane == 0) {
++        device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
++        dst_ptr[0] = v;
++    }
+ }
+ 
+ template [[host_name("kernel_conv_transpose_1d_f32_f32")]]
+@@ -4895,7 +4899,8 @@
+     device const float * src1,
+     device        char * dst,
+     uint3   tgpig[[threadgroup_position_in_grid]],
+-    uint3    tgpg[[threadgroups_per_grid]]);
++    uint3    tgpg[[threadgroups_per_grid]],
++    ushort lane[[thread_index_in_simdgroup]]);
+ 
+ template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
+ kernel void kernel_conv_transpose_1d<half>(
+@@ -4904,7 +4909,8 @@
+     device const float * src1,
+     device        char * dst,
+     uint3   tgpig[[threadgroup_position_in_grid]],
+-    uint3    tgpg[[threadgroups_per_grid]]);
++    uint3    tgpg[[threadgroups_per_grid]],
++    ushort lane[[thread_index_in_simdgroup]]);
+ 
+ 
+ typedef void (conv_transpose_2d_t)(
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3829,7 +3829,8 @@
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 1, 1, 1);
++    // One SIMD group reduces input channels for each output sample.
++    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 32, 1, 1);
+ 
+     return 1;
+ }

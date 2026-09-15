@@ -92,7 +92,7 @@ void print_uso() {
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
-    safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
+    safe_print("  --codec-context-frames <n>  Override offline codec history (stateful streaming keeps full layer history)\n");
     safe_print("  --log-level <level>         error, warn, info, or debug (default: info)\n");
     safe_print("  --server                    Start HTTP server\n");
     safe_print("  -H, --host         <host>   Server host (default: 127.0.0.1)\n");

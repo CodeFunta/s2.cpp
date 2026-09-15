@@ -1008,11 +1008,8 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     bool stream_failed = false;
     const int32_t stream_decode_stride_frames =
         params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 4;
-    const int32_t codec_context_frames = params.codec_decode_context_frames >= 0
-        ? params.codec_decode_context_frames
-        : std::max(0, codec().streaming_history_frames());
     const int32_t stream_holdback_frames =
-        params.stream_holdback_frames >= 0 ? params.stream_holdback_frames : codec_context_frames;
+        std::max(0, params.stream_holdback_frames);
     const size_t samples_per_frame = static_cast<size_t>(std::max(1, codec().samples_per_code_frame()));
 
     auto emit_pcm_range = [&](const std::vector<float> & pcm,
@@ -1041,11 +1038,12 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
             ? total_frames
             : std::max(0, total_frames - stream_holdback_frames);
         if (stable_frames <= committed_frames && !finalize) {
+            last_decoded_frames = total_frames;
             return true;
         }
 
-        const int32_t window_start_frame = std::max(0, committed_frames - codec_context_frames);
-        const int32_t window_frames = total_frames - window_start_frame;
+        const int32_t window_start_frame = committed_frames;
+        const int32_t window_frames = stable_frames - committed_frames;
         if (window_frames <= 0) {
             return true;
         }
@@ -1060,14 +1058,14 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
             }
             std::copy(
                 accumulated_codes_by_cb[cb].begin() + window_start_frame,
-                accumulated_codes_by_cb[cb].begin() + total_frames,
+                accumulated_codes_by_cb[cb].begin() + stable_frames,
                 decode_codes.begin() + static_cast<size_t>(cb) * window_frames
             );
         }
 
         std::vector<float> pcm;
         const auto decode_t0 = std::chrono::steady_clock::now();
-        if (!codec().decode(decode_codes.data(), window_frames,
+        if (!codec().decode_stream(decode_codes.data(), window_frames,
                            params.gen.n_threads, pcm)) {
             safe_print_error_ln("Pipeline streaming: decode failed at frame batch ending " +
                                 std::to_string(total_frames - 1));
@@ -1079,16 +1077,12 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         stream_decode_ms += std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
         stream_decode_batches++;
 
-        const size_t emit_begin_samples =
-            static_cast<size_t>(std::max(0, committed_frames - window_start_frame)) * samples_per_frame;
-        const size_t emit_end_samples =
-            finalize
-                ? pcm.size()
-                : std::min(
-                    pcm.size(),
-                    static_cast<size_t>(std::max(0, stable_frames - window_start_frame)) * samples_per_frame
-                );
-        if (!emit_pcm_range(pcm, emit_begin_samples, emit_end_samples)) {
+        if (pcm.size() != static_cast<size_t>(window_frames) * samples_per_frame) {
+            sink.on_error("Codec streaming sample count mismatch");
+            stream_failed = true;
+            return false;
+        }
+        if (!emit_pcm_range(pcm, 0, pcm.size())) {
             return false;
         }
 
@@ -1117,6 +1111,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     const auto gen_t0 = std::chrono::steady_clock::now();
     GenerateResult res = generate(model(), tokenizer().config(), prompt, gen_params);
     const auto gen_t1 = std::chrono::steady_clock::now();
+    const double generation_decode_ms = stream_decode_ms;
 
     if (res.n_frames == 0) {
         if (stream_aborted) {
@@ -1154,7 +1149,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         : 0.0;
     const double total_ms_per_frame = res.n_frames > 0 ? (total_ms / res.n_frames) : 0.0;
     const double decode_ms_per_frame = res.n_frames > 0 ? (stream_decode_ms / res.n_frames) : 0.0;
-    const double ar_ms = std::max(0.0, gen_ms - stream_decode_ms);
+    const double ar_ms = std::max(0.0, gen_ms - generation_decode_ms);
     const double ar_ms_per_frame = res.n_frames > 0 ? (ar_ms / res.n_frames) : 0.0;
     const double total_rtf = audio_seconds > 0.0 ? ((total_ms / 1000.0) / audio_seconds) : 0.0;
 
@@ -1165,8 +1160,8 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         " ms, kv_init=" + std::to_string(kv_ms) +
         " ms, stride=" + std::to_string(stream_decode_stride_frames) +
         " frames, holdback=" + std::to_string(stream_holdback_frames) +
-        " frames, decode_context=" + std::to_string(codec_context_frames) +
-        " frames, generate=" + std::to_string(gen_ms) +
+        " frames, codec=stateful" +
+        ", generate=" + std::to_string(gen_ms) +
         " ms, stream_decode=" + std::to_string(stream_decode_ms) +
         " ms, stream_batches=" + std::to_string(stream_decode_batches) +
         ", ar_only=" + std::to_string(ar_ms) +

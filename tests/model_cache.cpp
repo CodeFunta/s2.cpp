@@ -1,0 +1,74 @@
+#include "s2_model.h"
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+struct Request {
+    std::vector<float> hidden;
+    std::vector<int32_t> prefix;
+    std::vector<float> logits;
+};
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    s2::SlowARModel model;
+    if (!model.load(argv[1], 0, s2::BackendType::Metal, -1)) return 3;
+    if (!model.init_kv_cache(32)) return 3;
+    const int rows = model.hparams().num_codebooks + 1;
+    std::vector<int32_t> prompt(16 * rows, 0);
+    for (int t = 0; t < 16; ++t) prompt[t * rows] = 100 + t;
+    s2::StepResult state;
+    if (!model.prefill_fast(prompt, 16, 4, state)) return 3;
+    std::vector<float> hidden = state.hidden;
+    std::vector<Request> requests;
+    std::vector<int32_t> prefix;
+    for (int n = 1; n < model.hparams().num_codebooks; ++n) {
+        prefix.push_back((n * 17) % model.hparams().codebook_size);
+        requests.push_back({hidden, prefix, {}});
+    }
+    requests.push_back({hidden, {3, 5}, {}});
+    requests.push_back({hidden, {4, 5, 7}, {}});
+    hidden[0] += 1.0f;
+    requests.push_back({hidden, {4, 5, 7, 11}, {}});
+    requests.push_back({hidden, {}, {}});
+    for (auto & r : requests)
+        if (!model.fast_decode(r.hidden, r.prefix, 4, r.logits)) return 4;
+    double max_error = 0, max_relative_rms = 0, max_total_variation = 0;
+    for (const auto & r : requests) {
+        model.clear_kv_cache();
+        std::vector<float> full;
+        if (!model.fast_decode(r.hidden, r.prefix, 4, full)) return 5;
+        if (full.size() != r.logits.size()) throw std::runtime_error("logit size differs");
+        double squared_error = 0, energy = 0;
+        for (size_t i = 0; i < full.size(); ++i) {
+            if (!std::isfinite(r.logits[i])) throw std::runtime_error("nonfinite cached logits");
+            double error = double(r.logits[i]) - full[i];
+            max_error = std::max(max_error, std::abs(error));
+            squared_error += error * error; energy += double(full[i]) * full[i];
+        }
+        max_relative_rms = std::max(max_relative_rms, std::sqrt(squared_error / std::max(energy, 1e-30)));
+        const auto expected_best = std::max_element(full.begin(), full.end());
+        const auto actual_best = std::max_element(r.logits.begin(), r.logits.end());
+        if (expected_best - full.begin() != actual_best - r.logits.begin())
+            throw std::runtime_error("cached greedy choice differs");
+        double expected_sum = 0, actual_sum = 0;
+        for (size_t i = 0; i < full.size(); ++i) {
+            expected_sum += std::exp((double(full[i]) - *expected_best) / 0.8);
+            actual_sum += std::exp((double(r.logits[i]) - *actual_best) / 0.8);
+        }
+        double variation = 0;
+        for (size_t i = 0; i < full.size(); ++i)
+            variation += std::abs(std::exp((double(full[i]) - *expected_best) / 0.8) / expected_sum -
+                                  std::exp((double(r.logits[i]) - *actual_best) / 0.8) / actual_sum);
+        max_total_variation = std::max(max_total_variation, variation / 2);
+    }
+    std::cout << "requests=" << requests.size() << " max_error=" << max_error
+              << " max_relative_rms=" << max_relative_rms
+              << " max_probability_total_variation=" << max_total_variation << std::endl;
+    // F32 precision keeps quantized Metal accumulation consistent across
+    // full-prefix and one-query shapes; tolerate only float rounding noise.
+    if (max_error > 1e-4 || max_total_variation > 1e-5)
+        throw std::runtime_error("cached logits differ from full recomputation");
+}

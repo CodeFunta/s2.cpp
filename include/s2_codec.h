@@ -36,6 +36,11 @@ public:
     bool decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
         std::vector<float> & audio_out);
 
+    // Appends codebook-major frames and returns only their PCM. History is
+    // bounded by each layer's receptive field; clear_decode_cache starts a stream.
+    bool decode_stream(const int32_t * codes, int32_t n_frames, int32_t n_threads,
+                       std::vector<float> & audio_out);
+
     void clear_decode_cache();
 
     int32_t sample_rate()     const { return sample_rate_; }
