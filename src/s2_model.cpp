@@ -921,9 +921,20 @@ bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threa
     return eval_cached(flat_tokens, 1, n_threads, result);
 }
 
+bool SlowARModel::prefill_semantic(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
+                                  int32_t n_threads, int32_t eos_id, StepResult & result) {
+    if (eos_id < 0 || eos_id >= hparams_.vocab_size) return false;
+    return eval_cached(flat_tokens, n_tokens, n_threads, result, eos_id);
+}
+
+bool SlowARModel::step_semantic(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
+                               int32_t eos_id, StepResult & result) {
+    return prefill_semantic(flat_tokens, 1, n_threads, eos_id, result);
+}
+
 bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
                                int32_t n_tokens, int32_t n_threads,
-                               StepResult & result) {
+                               StepResult & result, int32_t eos_id) {
     if (n_tokens <= 0) return false;
 
     const int32_t codebook_dim = hparams_.num_codebooks + 1;
@@ -1104,7 +1115,19 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         last_token_view(ctx0, slow_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
 
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.embeddings, hidden_last, "mul_mat:logits");
+    const int32_t logits_begin = eos_id >= 0 ? std::min(hparams_.semantic_begin_id, eos_id) : 0;
+    const int32_t logits_end = eos_id >= 0 ? std::max(hparams_.semantic_end_id, eos_id) : hparams_.vocab_size - 1;
+    const int32_t logits_count = logits_end - logits_begin + 1;
+    if (logits_begin < 0 || logits_end >= hparams_.vocab_size || logits_count <= 0) {
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_tensor * output_weight = weights_.embeddings;
+    if (eos_id >= 0) {
+        output_weight = ggml_view_2d(ctx0, output_weight, output_weight->ne[0], logits_count,
+            output_weight->nb[1], static_cast<size_t>(logits_begin) * output_weight->nb[1]);
+    }
+    ggml_tensor * logits = mul_mat_checked(ctx0, output_weight, hidden_last, "mul_mat:logits");
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
@@ -1139,9 +1162,10 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     result.hidden.resize(dim);
-    result.logits.resize(hparams_.vocab_size);
+    result.logits.resize(logits_count);
+    result.logits_offset = logits_begin;
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
-    ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
+    ggml_backend_tensor_get(logits, result.logits.data(), 0, static_cast<size_t>(logits_count) * sizeof(float));
 
     ggml_backend_sched_reset(sched_);
     ggml_free(ctx0);

@@ -71,4 +71,32 @@ int main(int argc, char **argv) {
     // full-prefix and one-query shapes; tolerate only float rounding noise.
     if (max_error > 1e-4 || max_total_variation > 1e-5)
         throw std::runtime_error("cached logits differ from full recomputation");
+    const auto & hp = model.hparams();
+    for (int32_t eos : {0, hp.semantic_begin_id - 33, hp.vocab_size - 1}) {
+        auto compare = [&](const s2::StepResult & full, const s2::StepResult & compact) {
+            const int32_t begin = std::min(hp.semantic_begin_id, eos);
+            const int32_t end = std::max(hp.semantic_end_id, eos);
+            if (full.logits_offset != 0 || full.logits.size() != size_t(hp.vocab_size) ||
+                compact.logits_offset != begin || compact.logits.size() != size_t(end - begin + 1) ||
+                full.hidden != compact.hidden)
+                throw std::runtime_error("semantic projection result shape/hidden differs");
+            for (size_t i = 0; i < compact.logits.size(); ++i)
+                if (compact.logits[i] != full.logits[begin + i])
+                    throw std::runtime_error("semantic/EOS logits differ from full projection");
+        };
+        std::vector<int32_t> token(rows, 3);
+        token[0] = hp.semantic_begin_id + 3;
+        s2::StepResult full_prefill, full_step, compact_prefill, compact_step;
+        model.clear_kv_cache();
+        if (!model.init_kv_cache(32)) return 6;
+        if (!model.prefill_fast(prompt, 16, 4, full_prefill) ||
+            !model.step(token, 4, full_step)) return 6;
+        model.clear_kv_cache();
+        if (!model.init_kv_cache(32)) return 7;
+        if (!model.prefill_semantic(prompt, 16, 4, eos, compact_prefill) ||
+            !model.step_semantic(token, 4, eos, compact_step)) return 7;
+        compare(full_prefill, compact_prefill);
+        compare(full_step, compact_step);
+    }
+    std::cout << "semantic/EOS full-projection parity: exact" << std::endl;
 }

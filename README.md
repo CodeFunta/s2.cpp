@@ -53,6 +53,22 @@ only their PCM. `clear_decode_cache` starts a new stream; immutable reordered
 weights remain reusable until model reload. Pipeline request scope resets history
 on success, cancellation, and failure. The decoder remains serial per instance.
 
+The streaming pipeline overlaps one owned codec task with subsequent AR work,
+joining before another decode or request teardown. PCM callbacks remain on the
+calling thread. The first batch is delivered synchronously to avoid adding AR
+polling latency; later batches are polled each frame and joined before another
+AR step when delivered audio has less than one frame of playback headroom.
+If a full stride would exhaust that headroom, the pipeline decodes a smaller
+available batch early instead of adding startup buffering.
+There is no unbounded decode queue. `ar_elapsed` includes GPU contention and decode backpressure;
+`stream_decode` is overlapping worker time and must not be subtracted from it.
+
+Stable codec chunk graphs are reused only after histories have saturated,
+with refreshed absolute positions; shape changes and request resets invalidate
+the cache. Generation projects only the contiguous semantic/EOS vocabulary range.
+The full-logit model APIs remain available, while `prefill_semantic` and
+`step_semantic` return the global token offset in `StepResult::logits_offset`.
+
 Inline cues are passed unchanged to the model, not parsed into a fixed enum:
 `[laughing] That was funny!`, `[sad] I understand.`, or
 `[whisper in small voice] A quiet secret.`

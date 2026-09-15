@@ -180,6 +180,7 @@ struct AudioCodec::Impl {
     std::vector<vq_cache> residual_vq;
 
     codec_decode_cache decode_cache;
+    codec_decode_cache stream_decode_cache;
     codec_stream_state stream;
 };
 
@@ -212,6 +213,7 @@ static void reset_decode_cache(codec_decode_cache & cache, bool preserve_failed_
 
 static void reset_codec_impl(AudioCodec::Impl & impl) {
     reset_decode_cache(impl.decode_cache, false);
+    reset_decode_cache(impl.stream_decode_cache, false);
     impl.stream.clear();
     impl.stream.transpose_weights.clear();
     if (impl.model_buf) {
@@ -832,6 +834,7 @@ const char * AudioCodec::backend_name() const {
 void AudioCodec::clear_decode_cache() {
     if (impl_) {
         reset_decode_cache(impl_->decode_cache, false);
+        reset_decode_cache(impl_->stream_decode_cache, false);
         impl_->stream.clear();
     }
 }
@@ -1453,15 +1456,26 @@ bool AudioCodec::decode_stream(const int32_t * codes, int32_t n_frames, int32_t 
     if (n_frames > std::numeric_limits<int32_t>::max() - stream.frames) return false;
     stream.backend = impl_->backend;
     stream.updates.clear();
-    codec_decode_cache cache;
+    auto & cache = impl_->stream_decode_cache;
+    // Inspect histories before graph construction mutates their filled counts.
+    bool stable = !stream.histories.empty() &&
+                  stream.frames >= impl_->rvq_transformer_window_size - 1;
+    for (const auto & entry : stream.histories)
+        stable = stable && entry.second->filled == entry.second->tensor->ne[1];
+    const bool reuse = stable && cache.ctx && cache.n_frames == n_frames;
     bool ok = false;
     try {
-        ok = build_cached_decode_graph(*impl_, cache, n_frames, &stream) &&
+        if (reuse) {
+            // At saturation mask and history shapes stay constant; RoPE positions advance.
+            for (size_t i = 0; i < cache.inp.position_values.size(); ++i)
+                cache.inp.position_values[i] = stream.frames + static_cast<int32_t>(i);
+        }
+        ok = (reuse || build_cached_decode_graph(*impl_, cache, n_frames, &stream)) &&
              run_decode_graph(*impl_, cache, codes, n_frames, n_threads, audio_out);
     } catch (const std::exception & e) {
         std::cerr << "[Codec::decode_stream] " << e.what() << std::endl;
     }
-    reset_decode_cache(cache, false);
+    if (!ok || !stable) reset_decode_cache(cache, false);
     stream.updates.clear();
     if (ok) {
         stream.frames += n_frames;

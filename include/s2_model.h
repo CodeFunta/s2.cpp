@@ -87,6 +87,7 @@ struct ModelWeights {
 struct StepResult {
     std::vector<float> hidden;
     std::vector<float> logits;
+    int32_t logits_offset = 0;
 };
 
 class SlowARModel {
@@ -112,7 +113,7 @@ public:
 private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
         int32_t n_tokens, int32_t n_threads,
-        StepResult & result);
+        StepResult & result, int32_t eos_id = -1);
 public:
     bool prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
         int32_t n_threads, StepResult & result);
@@ -122,6 +123,11 @@ public:
 
     bool step(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
               StepResult & result);
+
+    bool prefill_semantic(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
+                          int32_t n_threads, int32_t eos_id, StepResult & result);
+    bool step_semantic(const std::vector<int32_t> & flat_tokens, int32_t n_threads,
+                       int32_t eos_id, StepResult & result);
 
     bool fast_decode(const std::vector<float> & hidden,
                      const std::vector<int32_t> & prefix_codes,

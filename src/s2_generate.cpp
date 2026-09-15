@@ -26,13 +26,16 @@ GenerateResult generate(
     const int32_t im_end_id    = config.im_end_id;
     const int32_t num_cb       = out.num_codebooks;
 
-    std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
-    for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) {
-        sem_mask[i] = 0.0f;
+    if (im_end_id < 0 || im_end_id >= vocab_size || sem_begin < 0 ||
+        sem_end < sem_begin || sem_end >= vocab_size) {
+        std::cerr << "[Generate] Invalid semantic/EOS range." << std::endl;
+        return out;
     }
-    if (im_end_id >= 0 && im_end_id < vocab_size) {
-        sem_mask[im_end_id] = 0.0f;
-    }
+    const int32_t logits_begin = std::min(sem_begin, im_end_id);
+    const int32_t logits_size = std::max(sem_end, im_end_id) - logits_begin + 1;
+    std::vector<float> sem_mask(logits_size, -std::numeric_limits<float>::infinity());
+    for (int32_t i = sem_begin; i <= sem_end; ++i) sem_mask[i - logits_begin] = 0.0f;
+    sem_mask[im_end_id - logits_begin] = 0.0f;
 
     const int32_t rows = prompt.rows;
     const int32_t cols = prompt.cols;
@@ -48,7 +51,7 @@ GenerateResult generate(
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
     const auto prefill_t0 = std::chrono::steady_clock::now();
-    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
+    if (!model.prefill_semantic(prompt_tm, prompt.cols, params.n_threads, im_end_id, state)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
         return out;
     }
@@ -56,18 +59,18 @@ GenerateResult generate(
 
     auto apply_mask_and_sample = [&](const std::vector<float> & logits,
                                      bool block_im_end) -> int32_t {
-        std::vector<float> biased(vocab_size);
-        for (int32_t i = 0; i < vocab_size; ++i) {
+        std::vector<float> biased(logits_size);
+        for (int32_t i = 0; i < logits_size; ++i) {
             biased[i] = logits[i] + sem_mask[i];
         }
         if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size) {
-            biased[im_end_id] = -std::numeric_limits<float>::infinity();
+            biased[im_end_id - logits_begin] = -std::numeric_limits<float>::infinity();
         }
         SamplerParams sparams;
         sparams.temperature     = params.temperature;
         sparams.top_p           = params.top_p;
         sparams.top_k           = params.top_k;
-        return sample_token(biased.data(), vocab_size, sparams);
+        return logits_begin + sample_token(biased.data(), logits_size, sparams);
     };
 
     bool block_end = (params.min_tokens_before_end > 0);
@@ -101,18 +104,18 @@ GenerateResult generate(
             main_token >= sem_begin && main_token <= sem_end)
         {
 
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
+            std::vector<float> biased(logits_size);
+            for (int32_t i = 0; i < logits_size; ++i) {
                 biased[i] = state.logits[i] + sem_mask[i];
             }
             if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size) {
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
+                biased[im_end_id - logits_begin] = -std::numeric_limits<float>::infinity();
             }
             SamplerParams ras_sparams;
             ras_sparams.temperature = ras_high_temp;
             ras_sparams.top_p       = ras_high_top_p;
             ras_sparams.top_k       = params.top_k;
-            main_token = sample_token(biased.data(), vocab_size, ras_sparams);
+            main_token = logits_begin + sample_token(biased.data(), logits_size, ras_sparams);
         }
 
         ras_window.push_back(main_token);
@@ -168,7 +171,7 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
-        if (!model.step(step_input, params.n_threads, state)) {
+        if (!model.step_semantic(step_input, params.n_threads, im_end_id, state)) {
             std::cerr << "[Generate] step() failed at step " << step << std::endl;
             break;
         }

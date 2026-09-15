@@ -22,7 +22,9 @@ int main(int argc, char **argv) {
         std::ofstream file(argv[3], std::ios::binary);
         file.write(reinterpret_cast<const char *>(reference.data()), reference.size() * sizeof(float));
     }
-    const std::vector<int> chunks{1, 3, 8, 4, 16};
+    // Repeated chunks after history saturation exercise retained graphs;
+    // alternating shapes and the final tail exercise invalidation.
+    const std::vector<int> chunks{1, 3, 8, 4, 4, 4, 4, 16};
     for (int pass = 0; pass < 2; ++pass) {
         codec.clear_decode_cache();
         std::vector<float> streamed;

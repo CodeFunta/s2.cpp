@@ -1,3 +1,4 @@
+#include <future>
 #include "../include/s2_pipeline.h"
 #include "../include/s2_log.h"
 #include <algorithm>
@@ -1000,6 +1001,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     }
     std::vector<int32_t> decode_codes;
     size_t emitted_samples = 0;
+    auto pcm_deadline = std::chrono::steady_clock::now();
     int32_t last_decoded_frames = 0;
     int32_t committed_frames = 0;
     double stream_decode_ms = 0.0;
@@ -1025,11 +1027,43 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
             stream_aborted = true;
             return false;
         }
+        if (emitted_samples == 0) pcm_deadline = std::chrono::steady_clock::now();
+        pcm_deadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(static_cast<double>(delta_count) / sample_rate));
         emitted_samples += delta_count;
         return true;
     };
 
+    struct DecodeResult {
+        std::vector<float> pcm;
+        double elapsed_ms;
+        int32_t frames;
+    };
+    // Single-flight: bounded storage and exclusive codec history ownership.
+    // The future is destroyed before the request's codec reset scope.
+    std::future<DecodeResult> pending_decode;
+    double last_decode_ms = 0.0;
+    auto finish_decode = [&]() -> bool {
+        if (!pending_decode.valid()) return true;
+        try {
+            auto result = pending_decode.get();
+            stream_decode_ms += result.elapsed_ms;
+            last_decode_ms = result.elapsed_ms;
+            ++stream_decode_batches;
+            if (sink.is_cancelled()) stream_aborted = true;
+            if (stream_aborted) return false;
+            if (result.pcm.size() != static_cast<size_t>(result.frames) * samples_per_frame)
+                throw std::runtime_error("Codec streaming sample count mismatch");
+            return emit_pcm_range(result.pcm, 0, result.pcm.size());
+        } catch (const std::exception & e) {
+            stream_failed = true;
+            sink.on_error(e.what());
+            return false;
+        }
+    };
+
     auto decode_window_and_emit = [&](int32_t total_frames, bool finalize) -> bool {
+        if (!finish_decode()) return false;
         if (total_frames <= 0 || total_frames <= committed_frames) {
             return true;
         }
@@ -1063,31 +1097,33 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
             );
         }
 
-        std::vector<float> pcm;
-        const auto decode_t0 = std::chrono::steady_clock::now();
-        if (!codec().decode_stream(decode_codes.data(), window_frames,
-                           params.gen.n_threads, pcm)) {
-            safe_print_error_ln("Pipeline streaming: decode failed at frame batch ending " +
-                                std::to_string(total_frames - 1));
-            sink.on_error("Codec decode failed");
+        try {
+            pending_decode = std::async(std::launch::async,
+                [this, codes = std::move(decode_codes), window_frames,
+                 n_threads = params.gen.n_threads]() {
+                    DecodeResult result{{}, 0.0, window_frames};
+                    const auto start = std::chrono::steady_clock::now();
+                    if (!codec().decode_stream(codes.data(), window_frames, n_threads, result.pcm))
+                        throw std::runtime_error("Codec decode failed");
+                    result.elapsed_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                    return result;
+                });
+        } catch (const std::exception & e) {
             stream_failed = true;
-            return false;
-        }
-        const auto decode_t1 = std::chrono::steady_clock::now();
-        stream_decode_ms += std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
-        stream_decode_batches++;
-
-        if (pcm.size() != static_cast<size_t>(window_frames) * samples_per_frame) {
-            sink.on_error("Codec streaming sample count mismatch");
-            stream_failed = true;
-            return false;
-        }
-        if (!emit_pcm_range(pcm, 0, pcm.size())) {
+            sink.on_error(e.what());
             return false;
         }
 
         committed_frames = finalize ? total_frames : stable_frames;
         last_decoded_frames = total_frames;
+        // If playback has less than one frame of headroom, deliver this batch
+        // before starting another AR step. This adds no startup buffering.
+        const auto frame_duration = std::chrono::duration<double>(
+            static_cast<double>(samples_per_frame) / sample_rate);
+        if (emitted_samples == 0 ||
+            pcm_deadline - std::chrono::steady_clock::now() <= frame_duration)
+            return finish_decode();
         return true;
     };
 
@@ -1101,9 +1137,18 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         for (int32_t cb = 0; cb < fcd.num_codebooks; ++cb) {
             accumulated_codes_by_cb[cb].push_back(fcd.codes[cb]);
         }
+        if (pending_decode.valid() &&
+            pending_decode.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready &&
+            !finish_decode()) return false;
 
         if ((fcd.total_frames - last_decoded_frames) < stream_decode_stride_frames) {
-            return true;
+            // Start a smaller batch before playback runs out, rather than
+            // buffering more audio or waiting for a full stride.
+            const auto needed = std::chrono::duration<double>(
+                last_decode_ms / 1000.0 + static_cast<double>(samples_per_frame) / sample_rate);
+            if (emitted_samples == 0 || pending_decode.valid() ||
+                pcm_deadline - std::chrono::steady_clock::now() > needed)
+                return true;
         }
         return decode_window_and_emit(fcd.total_frames, false);
     };
@@ -1111,7 +1156,10 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     const auto gen_t0 = std::chrono::steady_clock::now();
     GenerateResult res = generate(model(), tokenizer().config(), prompt, gen_params);
     const auto gen_t1 = std::chrono::steady_clock::now();
-    const double generation_decode_ms = stream_decode_ms;
+    if (!finish_decode()) {
+        model().clear_kv_cache();
+        return false;
+    }
 
     if (res.n_frames == 0) {
         if (stream_aborted) {
@@ -1130,7 +1178,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     }
 
     if (res.n_frames > last_decoded_frames || committed_frames < res.n_frames) {
-        if (!decode_window_and_emit(res.n_frames, true)) {
+        if (!decode_window_and_emit(res.n_frames, true) || !finish_decode()) {
             model().clear_kv_cache();
             return false;
         }
@@ -1149,7 +1197,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         : 0.0;
     const double total_ms_per_frame = res.n_frames > 0 ? (total_ms / res.n_frames) : 0.0;
     const double decode_ms_per_frame = res.n_frames > 0 ? (stream_decode_ms / res.n_frames) : 0.0;
-    const double ar_ms = std::max(0.0, gen_ms - generation_decode_ms);
+    const double ar_ms = gen_ms; // Includes contention/backpressure; codec overlaps this interval.
     const double ar_ms_per_frame = res.n_frames > 0 ? (ar_ms / res.n_frames) : 0.0;
     const double total_rtf = audio_seconds > 0.0 ? ((total_ms / 1000.0) / audio_seconds) : 0.0;
 
@@ -1164,7 +1212,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         ", generate=" + std::to_string(gen_ms) +
         " ms, stream_decode=" + std::to_string(stream_decode_ms) +
         " ms, stream_batches=" + std::to_string(stream_decode_batches) +
-        ", ar_only=" + std::to_string(ar_ms) +
+        ", ar_elapsed=" + std::to_string(ar_ms) +
         " ms, total=" + std::to_string(total_ms) +
         " ms, total_avg=" + std::to_string(total_ms_per_frame) +
         " ms/frame, decode_avg=" + std::to_string(decode_ms_per_frame) +
