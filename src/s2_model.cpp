@@ -481,6 +481,26 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         return false;
     }
 
+    // RMS normalization consumes F32 activations. Expand immutable half weights
+    // once at load instead of casting them on every autoregressive step.
+    auto expand_norm = [](ggml_tensor * tensor) {
+        if (!tensor || tensor->type != GGML_TYPE_F16) return;
+        tensor->type = GGML_TYPE_F32;
+        tensor->nb[0] = sizeof(float);
+        for (int d = 1; d < GGML_MAX_DIMS; ++d)
+            tensor->nb[d] = tensor->nb[d - 1] * tensor->ne[d - 1];
+    };
+    expand_norm(weights_.norm);
+    expand_norm(weights_.fast_norm);
+    for (auto * layers : {&weights_.layers, &weights_.fast_layers}) {
+        for (auto & layer : *layers) {
+            expand_norm(layer.attention_norm);
+            expand_norm(layer.ffn_norm);
+            expand_norm(layer.q_norm);
+            expand_norm(layer.k_norm);
+        }
+    }
+
     std::vector<ggml_tensor *> weight_tensors;
     weight_tensors.reserve(1 + 1 + 1 + 1 + 1 + 1 +
                            weights_.layers.size() * 7 +
@@ -716,6 +736,7 @@ bool SlowARModel::read_tensor_data(const std::string & gguf_path, gguf_context *
         return false;
     }
     std::vector<uint8_t> tmp;
+    std::vector<float> expanded;
     for (int64_t ti = 0; ti < n_tensors; ++ti) {
         const char * tname = gguf_get_tensor_name(ctx_gguf, ti);
         ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, tname);
@@ -723,7 +744,7 @@ bool SlowARModel::read_tensor_data(const std::string & gguf_path, gguf_context *
         if (!t || weight_tensor_set_.find(t) == weight_tensor_set_.end()) continue;
 
         const size_t toff  = data_offset + gguf_get_tensor_offset(ctx_gguf, ti);
-        const size_t tsize = ggml_nbytes(t);
+        const size_t tsize = gguf_get_tensor_size(ctx_gguf, ti);
         if (tmp.size() < tsize) tmp.resize(tsize);
 #ifdef _WIN32
         _fseeki64(f, (int64_t)toff, SEEK_SET);
@@ -735,7 +756,14 @@ bool SlowARModel::read_tensor_data(const std::string & gguf_path, gguf_context *
             std::fclose(f);
             return false;
         }
-        ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+        if (gguf_get_tensor_type(ctx_gguf, ti) == GGML_TYPE_F16 && t->type == GGML_TYPE_F32) {
+            expanded.resize(ggml_nelements(t));
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(tmp.data()),
+                                  expanded.data(), expanded.size());
+            ggml_backend_tensor_set(t, expanded.data(), 0, ggml_nbytes(t));
+        } else {
+            ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+        }
     }
     tmp.clear();
     tmp.shrink_to_fit();

@@ -322,6 +322,7 @@ static bool read_all_tensor_data(
     const auto & model_weights = model.weight_tensor_set();
     ggml_context * codec_ctx = codec.weights_ctx();
     std::vector<uint8_t> tmp;
+    std::vector<float> expanded;
 
     for (int64_t ti = 0; ti < n_tensors; ++ti) {
         const char * tname = gguf_get_tensor_name(gguf_ctx, ti);
@@ -329,7 +330,7 @@ static bool read_all_tensor_data(
 
         ggml_tensor * t = ggml_get_tensor(model.weights_ctx(), tname);
         if (t && model_weights.find(t) != model_weights.end()) {
-            const size_t tsize = ggml_nbytes(t);
+            const size_t tsize = gguf_get_tensor_size(gguf_ctx, ti);
             if (tmp.size() < tsize) tmp.resize(tsize);
 #ifdef _WIN32
             _fseeki64(f, (int64_t)toff, SEEK_SET);
@@ -341,7 +342,14 @@ static bool read_all_tensor_data(
                 std::fclose(f);
                 return false;
             }
-            ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+            if (gguf_get_tensor_type(gguf_ctx, ti) == GGML_TYPE_F16 && t->type == GGML_TYPE_F32) {
+                expanded.resize(ggml_nelements(t));
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(tmp.data()),
+                                      expanded.data(), expanded.size());
+                ggml_backend_tensor_set(t, expanded.data(), 0, ggml_nbytes(t));
+            } else {
+                ggml_backend_tensor_set(t, tmp.data(), 0, tsize);
+            }
             continue;
         }
 
