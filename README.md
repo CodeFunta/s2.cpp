@@ -65,8 +65,9 @@ joining before another decode or request teardown. PCM callbacks remain on the
 calling thread. The first batch is delivered synchronously to avoid adding AR
 polling latency; later batches are polled each frame and joined before another
 AR step when delivered audio has less than one frame of playback headroom.
-If a full stride would exhaust that headroom, the pipeline decodes a smaller
-available batch early instead of adding startup buffering.
+Low playback headroom may force an existing decode to finish, but does not
+launch a new underfilled batch. New non-final decodes retain the configured
+stride; the final partial tail is still emitted without adding startup buffering.
 There is no unbounded decode queue. `ar_elapsed` includes GPU contention and decode backpressure;
 `stream_decode` is overlapping worker time and must not be subtracted from it.
 

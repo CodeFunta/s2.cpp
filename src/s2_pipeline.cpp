@@ -1150,13 +1150,18 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
             !finish_decode()) return false;
 
         if ((fcd.total_frames - last_decoded_frames) < stream_decode_stride_frames) {
-            // Start a smaller batch before playback runs out, rather than
-            // buffering more audio or waiting for a full stride.
+            // Low PCM lead may require harvesting an existing decode, but must
+            // not turn a full-stride stream into one-frame decode lockstep.
             const auto needed = std::chrono::duration<double>(
                 last_decode_ms / 1000.0 + static_cast<double>(samples_per_frame) / sample_rate);
-            if (emitted_samples == 0 || pending_decode.valid() ||
+            if (emitted_samples == 0 ||
                 pcm_deadline - std::chrono::steady_clock::now() > needed)
                 return true;
+            // Native PCM lead is exhausted. Complete the sole owned decode before
+            // advancing AR; otherwise ready code frames accumulate into a later burst.
+            if (pending_decode.valid())
+                return finish_decode();
+            return true;
         }
         return decode_window_and_emit(fcd.total_frames, false);
     };
