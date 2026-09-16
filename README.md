@@ -45,7 +45,7 @@ ctest --test-dir build --output-on-failure
 All ggml changes are reproducible patches under `patches/`, applied by the
 existing CMake patch target. Do not distribute only a dirty submodule checkout.
 Without `S2_TEST_MODEL`, the model-dependent binaries build but only the
-model-independent Metal padding/convolution test is registered with CTest.
+model-independent Metal padding/convolution and sampler tests are registered with CTest.
 
 For actual frame streaming, select `--metal --gpu-layers -1
 --codec-follow-backend` and use `stream=true`, `chunked=true`,
@@ -96,6 +96,12 @@ its actual nodes and leaf references. Every input is refreshed on reuse, and
 graph owners are released before their KV buffers. Other prefix shapes, CPU,
 and partial offload keep the uncached path. Computation, F32 accumulation,
 and sequential codebook dependencies are unchanged.
+
+CPU sampling radix-sorts large finite vocabularies without changing the full
+softmax reduction order, top-p-before-temperature filtering, or RNG consumption.
+Small vocabularies and nonfinite values retain comparison sorting. If equal
+logits touch the top-k prefix or its boundary, the original input is restored
+before comparison sorting so the same token IDs remain eligible.
 
 Inline cues are passed unchanged to the model, not parsed into a fixed enum:
 `[laughing] That was funny!`, `[sad] I understand.`, or
