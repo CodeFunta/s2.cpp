@@ -60,6 +60,12 @@ static bool backend_requires_single_token_semantic_prefill(ggml_backend_t backen
     return false;
 }
 
+static ggml_tensor * contiguous_if_needed(ggml_context * ctx, ggml_tensor * tensor) {
+    // A single-row QKV slice is contiguous even when its unused row stride
+    // spans the full projection. Keep the view and its allocator dependency.
+    return ggml_is_contiguous(tensor) ? tensor : ggml_cont(ctx, tensor);
+}
+
 static ggml_tensor * rms_norm_weighted(ggml_context * ctx, ggml_tensor * x,
                                        ggml_tensor * weight, float eps) {
     ggml_tensor * cur = ggml_rms_norm(ctx, x, eps);
@@ -1125,9 +1131,9 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], q_size * elem_size);
         ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], (q_size + kv_size) * elem_size);
 
-        ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q2d), head_dim, n_head, n_tokens);
-        ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_cont(ctx0, k2d), head_dim, n_head_kv, n_tokens);
-        ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_cont(ctx0, v2d), head_dim, n_head_kv, n_tokens);
+        ggml_tensor * q = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, q2d), head_dim, n_head, n_tokens);
+        ggml_tensor * k = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, k2d), head_dim, n_head_kv, n_tokens);
+        ggml_tensor * v = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, v2d), head_dim, n_head_kv, n_tokens);
 
         if (hparams_.attention_qk_norm) {
             q = rms_norm_weighted(ctx0, q, layer.q_norm, hparams_.rms_norm_eps);
@@ -1384,9 +1390,9 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], q_size * elem_size);
         ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], (q_size + kv_size) * elem_size);
 
-        ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q2d), head_dim, n_head, n_tokens);
-        ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_cont(ctx0, k2d), head_dim, n_head_kv, n_tokens);
-        ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_cont(ctx0, v2d), head_dim, n_head_kv, n_tokens);
+        ggml_tensor * q = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, q2d), head_dim, n_head, n_tokens);
+        ggml_tensor * k = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, k2d), head_dim, n_head_kv, n_tokens);
+        ggml_tensor * v = ggml_reshape_3d(ctx0, contiguous_if_needed(ctx0, v2d), head_dim, n_head_kv, n_tokens);
 
         if (hparams_.fast_attention_qk_norm) {
             q = rms_norm_weighted(ctx0, q, layer.q_norm, hparams_.fast_rms_norm_eps);

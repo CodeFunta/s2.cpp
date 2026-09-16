@@ -97,6 +97,11 @@ graph owners are released before their KV buffers. Other prefix shapes, CPU,
 and partial offload keep the uncached path. Computation, F32 accumulation,
 and sequential codebook dependencies are unchanged.
 
+Q/K/V slices that are already contiguous remain views of the combined projection.
+This avoids redundant copies during single-token slow/fast decoding; multi-token
+prefill still materializes strided slices. GGML tracks the shared storage through
+all consumers, including the existing post-attention history rounding.
+
 CPU sampling radix-sorts large finite vocabularies without changing the full
 softmax reduction order, top-p-before-temperature filtering, or RNG consumption.
 Small vocabularies and nonfinite values retain comparison sorting. If equal
