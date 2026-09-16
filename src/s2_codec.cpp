@@ -306,6 +306,15 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
                                      ggml_tensor * weight, ggml_tensor * bias,
                                      ggml_tensor * x, int stride, int dilation,
                                      codec_stream_state * stream = nullptr) {
+    if (weight->ne[0] == 1 && stride == 1) {
+        // Pointwise convolution needs no history or spatial unfolding. Keep the
+        // im2col F16 rounding and original matrix operand order unchanged.
+        auto * input = ggml_cast(ctx, x, GGML_TYPE_F16);
+        auto * weights = ggml_reshape_2d(ctx, weight, weight->ne[1], weight->ne[2]);
+        auto * y = ggml_mul_mat(ctx, input, weights);
+        y = add_channel_bias_lc(ctx, y, bias);
+        return lc_to_cl(ctx, y);
+    }
     const int kernel_size = static_cast<int>((weight->ne[0] - 1) * dilation + 1);
     const int pad   = kernel_size - stride;
     const int extra = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad));

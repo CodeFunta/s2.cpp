@@ -19,6 +19,9 @@ Streaming processes only new codes: attention KV and convolution history are
 retained per layer, with bounded storage rather than repeated prefix decoding.
 Metal transposed convolutions use cached weight reordering plus GEMM/overlap-add;
 the generic Metal operator also has a SIMD channel reduction.
+Pointwise (width-one, stride-one) convolutions bypass spatial unfolding and its
+input transpose. An explicit F16 cast preserves IM2COL's input rounding, while
+matrix operand order, bias application, and output layout remain unchanged.
 
 Quantized Metal batch kernels can change arithmetic with batch size. This fork
 honors explicit `GGML_PREC_F32` using the consistent matrix-vector path, which
