@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 
 #include "s2_backend.h"
 #include "ggml.h"
@@ -163,6 +164,9 @@ private:
     std::vector<int32_t> fast_prefix_;
 
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
+
+    struct FastGraph;
+    std::vector<std::unique_ptr<FastGraph>> fast_graphs_;
 
 };
 

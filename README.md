@@ -89,6 +89,14 @@ prefix is read, so unused capacity is not zero-filled. Reserved slow-KV capacity
 is twice the F16 allocation; actual physical footprint depends on touched pages
 and graph workspaces. CPU and partial-offload paths retain the compact F16 cache.
 
+Full Metal offload also retains fast-AR graphs for the initial two-token call
+and the subsequent single-token codebook extensions. The cache is bounded by
+the number of codebooks; each graph owns its context and a scheduler sized from
+its actual nodes and leaf references. Every input is refreshed on reuse, and
+graph owners are released before their KV buffers. Other prefix shapes, CPU,
+and partial offload keep the uncached path. Computation, F32 accumulation,
+and sequential codebook dependencies are unchanged.
+
 Inline cues are passed unchanged to the model, not parsed into a fixed enum:
 `[laughing] That was funny!`, `[sad] I understand.`, or
 `[whisper in small voice] A quiet secret.`

@@ -235,9 +235,42 @@ static bool allocate_weight_buffers(ggml_backend_t backend,
     return true;
 }
 
+struct SlowARModel::FastGraph {
+    ggml_context * ctx = nullptr;
+    ggml_backend_sched_t scheduler = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * hidden = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * prefix = nullptr;
+    ggml_tensor * logits = nullptr;
+    std::vector<float> mask_values;
+    std::vector<int32_t> position_values;
+
+    ~FastGraph() {
+        if (scheduler) ggml_backend_sched_free(scheduler);
+        if (ctx) ggml_free(ctx);
+    }
+
+    bool evaluate(const std::vector<float> & hidden_in,
+                  const std::vector<int32_t> & prefix_tokens,
+                  std::vector<float> & logits_out) {
+        // Allocator storage can alias inputs after their final use; refresh every input.
+        if (mask) ggml_backend_tensor_set(mask, mask_values.data(), 0, mask_values.size() * sizeof(float));
+        if (hidden) ggml_backend_tensor_set(hidden, hidden_in.data(), 0, hidden_in.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(int32_t));
+        if (prefix) ggml_backend_tensor_set(prefix, &prefix_tokens.back(), 0, sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(scheduler, graph) != GGML_STATUS_SUCCESS) return false;
+        logits_out.resize(ggml_nelements(logits));
+        ggml_backend_tensor_get(logits, logits_out.data(), 0, logits_out.size() * sizeof(float));
+        return true;
+    }
+};
+
 SlowARModel::SlowARModel() {}
 
 SlowARModel::~SlowARModel() {
+    fast_graphs_.clear();
     if (fast_sched_)     ggml_backend_sched_free(fast_sched_);
     if (sched_)          ggml_backend_sched_free(sched_);
 
@@ -256,6 +289,7 @@ SlowARModel::~SlowARModel() {
 }
 
 bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_path, int32_t gpu_device, BackendType backend_type, int32_t n_gpu_layers) {
+    fast_graphs_.clear();
 
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
@@ -866,6 +900,7 @@ void SlowARModel::reset() {
 }
 
 void SlowARModel::clear_kv_cache() {
+    fast_graphs_.clear();
     fast_prefix_.clear();
     fast_hidden_.clear();
     if (fast_kv_buf_) ggml_backend_buffer_free(fast_kv_buf_);
@@ -1284,11 +1319,32 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         }
     }
 
-    if (fast_ctx_size_ == 0) {
-        fast_ctx_size_ = 8u * 1024u * 1024u;
-        fast_ctx_buf_.resize(fast_ctx_size_);
+    bool cache_graph = false;
+#ifdef GGML_USE_METAL
+    cache_graph = backend_gpu_ && ggml_backend_is_metal(backend_gpu_) &&
+        n_gpu_layers_ == hparams_.block_count &&
+        (reuse_prefix || prefix_tokens.size() == 1);
+#endif
+    const size_t graph_index = prefix_tokens.size();
+    if (cache_graph) {
+        if (fast_graphs_.empty()) fast_graphs_.resize(hparams_.num_codebooks);
+        auto & cached = fast_graphs_[graph_index];
+        if (cached) {
+            ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
+            if (!cached->evaluate(hidden_in, prefix_tokens, logits_out)) {
+                cached.reset();
+                return false;
+            }
+            fast_hidden_ = hidden_in;
+            fast_prefix_ = prefix_tokens;
+            return true;
+        }
     }
-    ggml_init_params p = { fast_ctx_size_, fast_ctx_buf_.data(), true };
+
+    if (fast_ctx_size_ == 0) fast_ctx_size_ = 8u * 1024u * 1024u;
+    if (!cache_graph && fast_ctx_buf_.size() < fast_ctx_size_) fast_ctx_buf_.resize(fast_ctx_size_);
+    // Cached contexts own their arena; malloc leaves unused pages untouched.
+    ggml_init_params p = { fast_ctx_size_, cache_graph ? nullptr : fast_ctx_buf_.data(), true };
     ggml_context * ctx0 = ggml_init(p);
     if (!ctx0) return false;
 
@@ -1380,6 +1436,37 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1));
     ggml_tensor * logits = fast_linear(ctx0, weights_.fast_output, fast_last, "mul_mat:fast_logits");
     ggml_build_forward_expand(gf, logits);
+
+    if (cache_graph) {
+        auto cached = std::make_unique<FastGraph>();
+        cached->ctx = ctx0;
+        cached->graph = gf;
+        cached->mask = causal_mask;
+        cached->hidden = hidden0;
+        cached->positions = positions;
+        cached->prefix = prefix_ids;
+        cached->logits = logits;
+        cached->mask_values = std::move(causal_mask_values);
+        cached->position_values = std::move(pos_vals);
+        ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+        // The scheduler hash covers nodes and leaves. Every leaf here feeds a
+        // node; counting leaf references is a safe bound without another set.
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        size_t scheduler_size = n_nodes;
+        for (int i = 0; i < n_nodes; ++i) {
+            for (ggml_tensor * src : ggml_graph_node(gf, i)->src) {
+                if (src && src->op == GGML_OP_NONE) ++scheduler_size;
+            }
+        }
+        cached->scheduler = ggml_backend_sched_new(backends, nullptr, 2, scheduler_size, false, true);
+        if (!cached->scheduler || !ggml_backend_sched_alloc_graph(cached->scheduler, gf)) return false;
+        ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
+        if (!cached->evaluate(hidden_in, prefix_tokens, logits_out)) return false;
+        fast_graphs_[graph_index] = std::move(cached);
+        fast_hidden_ = hidden_in;
+        fast_prefix_ = prefix_tokens;
+        return true;
+    }
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
     ggml_backend_sched_reset(fast_sched_);

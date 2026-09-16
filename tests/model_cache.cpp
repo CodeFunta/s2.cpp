@@ -33,6 +33,12 @@ int main(int argc, char **argv) {
     hidden[0] += 1.0f;
     requests.push_back({hidden, {4, 5, 7, 11}, {}});
     requests.push_back({hidden, {}, {}});
+    // Revisit every retained graph with different hidden state and token inputs.
+    prefix.clear();
+    for (int n = 1; n < model.hparams().num_codebooks; ++n) {
+        prefix.push_back((n * 19) % model.hparams().codebook_size);
+        requests.push_back({hidden, prefix, {}});
+    }
     for (auto & r : requests)
         if (!model.fast_decode(r.hidden, r.prefix, 4, r.logits)) return 4;
     double max_error = 0, max_relative_rms = 0, max_total_variation = 0;
