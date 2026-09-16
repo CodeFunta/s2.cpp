@@ -74,6 +74,14 @@ model loading, rather than converted on every AR step. Both direct and pipeline
 loaders read the original GGUF byte lengths before expansion. Quantized matrices,
 KV-cache precision, and the fast-decoder F32 accumulation policy are unchanged.
 
+With full Metal offload, slow-AR attention reads a persistent F32 cache directly
+instead of converting and concatenating the entire history on each step. Current
+tokens stay unrounded until attention finishes; explicit ordered writes then
+restore the same F16-rounded historical values in F32 storage. Only the written
+prefix is read, so unused capacity is not zero-filled. Reserved slow-KV capacity
+is twice the F16 allocation; actual physical footprint depends on touched pages
+and graph workspaces. CPU and partial-offload paths retain the compact F16 cache.
+
 Inline cues are passed unchanged to the model, not parsed into a fixed enum:
 `[laughing] That was funny!`, `[sad] I understand.`, or
 `[whisper in small voice] A quiet secret.`

@@ -826,8 +826,17 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    ggml_type cache_type = GGML_TYPE_F16;
+#ifdef GGML_USE_METAL
+    // Direct attention avoids rebuilding the full history on every step.
+    // Keep the original compact cache for CPU and partial offload.
+    if (backend_gpu_ && ggml_backend_is_metal(backend_gpu_) &&
+        n_gpu_layers_ == hparams_.block_count) {
+        cache_type = GGML_TYPE_F32;
+    }
+#endif
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, cache_type, head_dim, n_head_kv, max_seq_len, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, cache_type, head_dim, n_head_kv, max_seq_len, n_layer);
 
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
@@ -836,8 +845,12 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
-    ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
+    // Direct attention reads only the written prefix. Every current slot is
+    // filled before attention, so touching the unused capacity is unnecessary.
+    if (cache_type == GGML_TYPE_F16) {
+        ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
+        ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
+    }
 
     S2_LOG_INFO_STREAM("[Model] KV cache allocated on "
               << (n_gpu_layers_ > 0 && backend_gpu_ ? ggml_backend_name(backend_gpu_) : "CPU")
@@ -1111,7 +1124,16 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
         ggml_tensor * k_mem = k;
         ggml_tensor * v_mem = v;
-        if (n_past_ > 0) {
+        const bool direct_cache = memory_k_->type == GGML_TYPE_F32;
+        if (direct_cache) {
+            GGML_ASSERT(k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+            k_mem = ggml_reshape_3d(ctx0,
+                ggml_view_1d(ctx0, memory_k_, static_cast<int64_t>(n_past_ + n_tokens) * kv_size, layer_off_k),
+                head_dim, n_head_kv, n_past_ + n_tokens);
+            v_mem = ggml_reshape_3d(ctx0,
+                ggml_view_1d(ctx0, memory_v_, static_cast<int64_t>(n_past_ + n_tokens) * kv_size, layer_off_v),
+                head_dim, n_head_kv, n_past_ + n_tokens);
+        } else if (n_past_ > 0) {
             ggml_tensor * k_past = ggml_reshape_3d(ctx0,
                 ggml_view_1d(ctx0, memory_k_, static_cast<int64_t>(n_past_) * kv_size, layer_off_k),
                 head_dim, n_head_kv, n_past_);
@@ -1125,6 +1147,14 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         }
 
         ggml_tensor * attn_cur = attention(ctx0, backend_gpu_, q, k_mem, v_mem, causal_mask, attn_scale);
+        if (direct_cache) {
+            // Current tokens must remain unrounded until attention has consumed
+            // them. Explicit graph order and cache alias barriers protect this
+            // read before restoring the original F16-rounded history values.
+            ggml_build_forward_expand(gf, attn_cur);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cast(ctx0, k, GGML_TYPE_F16), k_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cast(ctx0, v, GGML_TYPE_F16), v_slot));
+        }
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");
 
         ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
