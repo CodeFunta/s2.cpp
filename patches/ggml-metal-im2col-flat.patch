@@ -1,0 +1,41 @@
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3639,7 +3639,12 @@
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
++    if (N == 1) {
++        const uint64_t threads = std::min<uint64_t>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++        ggml_metal_encoder_dispatch_threadgroups(enc, (CHW + threads - 1) / threads, OH, OW, threads, 1, 1);
++    } else {
++        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
++    }
+ 
+     return 1;
+ }
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -4622,6 +4622,22 @@
+         uint3  tgpg[[threadgroups_per_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]]) {
++    if (args.N == 1) {
++        const uint channel_tap = tgpig.x * ntg.x + tpitg.x;
++        if (channel_tap >= uint(args.CHW)) return;
++        const int ic = channel_tap / args.KHW;
++        const int tap = channel_tap % args.KHW;
++        const int64_t iw = int64_t(tgpig.z) * args.s0 + (tap % args.KW) * args.d0 - args.p0;
++        const int64_t ih = int64_t(tgpig.y) * args.s1 + (tap / args.KW) * args.d1 - args.p1;
++        const int64_t out = (int64_t(tgpig.y) * tgpg.z + tgpig.z) * args.CHW + channel_tap;
++        device T * output = (device T *) dst;
++        if (ih < 0 || ih >= args.IH || iw < 0 || iw >= args.IW) {
++            output[out] = 0.0f;
++        } else {
++            output[out] = x[int64_t(ic) * args.ofs1 + int64_t(ih) * args.IW + iw];
++        }
++        return;
++    }
+ //    const int64_t IC = tgpg[0];
+     const int64_t OH = tgpg[1];
+     const int64_t OW = tgpg[2];

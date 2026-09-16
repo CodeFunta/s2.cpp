@@ -22,6 +22,10 @@ the generic Metal operator also has a SIMD channel reduction.
 Pointwise (width-one, stride-one) convolutions bypass spatial unfolding and its
 input transpose. An explicit F16 cast preserves IM2COL's input rounding, while
 matrix operand order, bias application, and output layout remain unchanged.
+Single-batch Metal IM2COL groups channel/tap elements into bounded workgroups
+instead of launching a tiny group for every channel and output position. Input
+indexing, padding zeros, and F16/F32 output conversion are unchanged; batched
+inputs retain the original dispatch.
 
 Quantized Metal batch kernels can change arithmetic with batch size. This fork
 honors explicit `GGML_PREC_F32` using the consistent matrix-vector path, which
