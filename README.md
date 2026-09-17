@@ -116,6 +116,10 @@ and writes, including fused inputs and aliased views. The interval cache is
 temporary; graph ordering, overlap boundaries, and numerical operations are
 unchanged.
 
+Metal CONCAT and non-quantized SET/CPY batch narrow rows into threadgroups
+capped at 256 threads. Each destination element remains an independent copy;
+quantized copies retain their existing one-row dispatch.
+
 CPU sampling radix-sorts large finite vocabularies without changing the full
 softmax reduction order, top-p-before-temperature filtering, or RNG consumption.
 Small vocabularies and nonfinite values retain comparison sorting. If equal
