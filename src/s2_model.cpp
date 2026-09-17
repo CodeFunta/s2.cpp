@@ -1160,12 +1160,15 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             head_dim, n_head_kv, n_tokens,
             memory_v_->nb[1], memory_v_->nb[2],
             layer_off_v + token_off_v);
+        const bool direct_cache = memory_k_->type == GGML_TYPE_F32;
+        // Visit the destination metadata before RoPE so its VIEW does not split
+        // the producer/cache-copy pair during backend graph optimization.
+        if (direct_cache) ggml_build_forward_expand(gf, k_slot);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, k_slot));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, v_slot));
 
         ggml_tensor * k_mem = k;
         ggml_tensor * v_mem = v;
-        const bool direct_cache = memory_k_->type == GGML_TYPE_F32;
         if (direct_cache) {
             GGML_ASSERT(k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
             k_mem = ggml_reshape_3d(ctx0,
@@ -1193,7 +1196,9 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             // them. Explicit graph order and cache alias barriers protect this
             // read before restoring the original F16-rounded history values.
             ggml_build_forward_expand(gf, attn_cur);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cast(ctx0, k, GGML_TYPE_F16), k_slot));
+            // The slot contains identical unrounded K values. Reading it here
+            // leaves RoPE single-use so Metal can write straight into the cache.
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cast(ctx0, k_slot, GGML_TYPE_F16), k_slot));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cast(ctx0, v, GGML_TYPE_F16), v_slot));
         }
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");

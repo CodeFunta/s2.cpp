@@ -1,8 +1,10 @@
 #include "s2_model.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 struct Request {
@@ -10,6 +12,37 @@ struct Request {
     std::vector<int32_t> prefix;
     std::vector<float> logits;
 };
+
+static void slow_cache_fusion_regression(const char * path) {
+    const char * previous = std::getenv("GGML_METAL_FUSION_DISABLE");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    std::vector<s2::StepResult> reference;
+    for (bool fused : {false, true}) {
+        if (fused) unsetenv("GGML_METAL_FUSION_DISABLE");
+        else setenv("GGML_METAL_FUSION_DISABLE", "1", 1);
+        s2::SlowARModel model;
+        if (!model.load(path, 0, s2::BackendType::Metal, -1) || !model.init_kv_cache(32))
+            throw std::runtime_error("slow cache model initialization failed");
+        const auto & hp = model.hparams();
+        const int rows = hp.num_codebooks + 1;
+        std::vector<int32_t> prompt(16 * rows, 0), token(rows, 3);
+        for (int t = 0; t < 16; ++t) prompt[t * rows] = 100 + t;
+        s2::StepResult state;
+        for (int step = 0; step < 3; ++step) {
+            token[0] = hp.semantic_begin_id + step;
+            const bool ok = step == 0
+                ? model.prefill_semantic(prompt, 16, 4, hp.semantic_begin_id - 33, state)
+                : model.step_semantic(token, 4, hp.semantic_begin_id - 33, state);
+            if (!ok) throw std::runtime_error("slow cache transition failed");
+            if (!fused) reference.push_back(state);
+            else if (state.hidden != reference[step].hidden || state.logits != reference[step].logits)
+                throw std::runtime_error("fused cache write changed current or historical attention");
+        }
+    }
+    if (had_previous) setenv("GGML_METAL_FUSION_DISABLE", saved.c_str(), 1);
+    else unsetenv("GGML_METAL_FUSION_DISABLE");
+}
 
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
@@ -105,4 +138,5 @@ int main(int argc, char **argv) {
         compare(full_step, compact_step);
     }
     std::cout << "semantic/EOS full-projection parity: exact" << std::endl;
+    slow_cache_fusion_regression(argv[1]);
 }

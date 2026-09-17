@@ -456,6 +456,91 @@ static void flash_attention_tail_regression(ggml_backend_t backend) {
     }
 }
 
+static void rope_cache_copy_regression(ggml_backend_t backend) {
+    constexpr int head = 128, heads = 2;
+    auto cpu = ggml_backend_cpu_init();
+    if (!cpu) throw std::runtime_error("RoPE cache CPU backend initialization failed");
+    ggml_backend_t backends[] = {backend, cpu};
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        const bool exposed = scenario == 1;
+        const bool shared = scenario == 2;
+        const bool overlap = scenario == 3;
+        // Multiple scheduling waves expose cross-row overlap hazards.
+        const int tokens = overlap ? 2048 : 3, count = head * heads * tokens;
+        auto * inputs = ggml_init({1 << 16, nullptr, true});
+        auto * reference_input = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, head, heads, tokens);
+        auto * source_storage = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, count + 2);
+        auto * cache_storage = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, count + 2);
+        auto * reference_storage = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, count + 2);
+        auto * positions = ggml_new_tensor_1d(inputs, GGML_TYPE_I32, tokens);
+        ggml_set_input(reference_input);
+        ggml_set_input(source_storage);
+        ggml_set_input(positions);
+        auto buffer = ggml_backend_alloc_ctx_tensors(inputs, backend);
+        if (!buffer) throw std::runtime_error("RoPE cache input allocation failed");
+
+        auto * ctx = ggml_init({1 << 20, nullptr, true});
+        const auto view = [&](ggml_tensor * storage, size_t offset) {
+            return ggml_view_3d(ctx, storage, head, heads, tokens,
+                head * sizeof(float), head * heads * sizeof(float), offset);
+        };
+        auto * source = view(source_storage, 0);
+        auto * reference_slot = view(reference_storage, sizeof(float));
+        auto * destination_storage = overlap ? source_storage : cache_storage;
+        auto * slot = view(destination_storage, sizeof(float));
+        const auto rotate = [&](ggml_tensor * input) {
+            return ggml_rope_ext(ctx, input, positions, nullptr, head, 0, 512,
+                10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        };
+        auto * reference = rotate(reference_input);
+        auto * candidate = rotate(source);
+        ggml_set_output(reference); // Force the independent two-dispatch oracle.
+        if (exposed) ggml_set_output(candidate);
+        auto * consumer = shared ? ggml_scale(ctx, candidate, 0.5f) : nullptr;
+        if (consumer) ggml_set_output(consumer);
+        auto * graph = ggml_new_graph(ctx);
+        // Destination VIEW metadata must not separate producer and copy.
+        ggml_build_forward_expand(graph, reference_slot);
+        ggml_build_forward_expand(graph, slot);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, reference, reference_slot));
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, candidate, slot));
+        if (consumer) ggml_build_forward_expand(graph, consumer);
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(graph), false, true);
+        if (!ggml_backend_sched_alloc_graph(sched, graph))
+            throw std::runtime_error("RoPE cache graph allocation failed");
+
+        std::vector<float> values(count + 2, -7.25f), guards(count + 2, -7.25f), expected(count), actual(count + 2);
+        for (int i = 0; i < count; ++i) values[i] = 0.2f * std::sin(float(i) * 0.13f);
+        std::vector<int32_t> position_values(tokens);
+        for (int t = 0; t < tokens; ++t) position_values[t] = 17 + 14 * t;
+        ggml_backend_tensor_set(reference_input, values.data(), 0, count * sizeof(float));
+        ggml_backend_tensor_set(source_storage, values.data(), 0, values.size() * sizeof(float));
+        ggml_backend_tensor_set(cache_storage, guards.data(), 0, guards.size() * sizeof(float));
+        ggml_backend_tensor_set(reference_storage, guards.data(), 0, guards.size() * sizeof(float));
+        ggml_backend_tensor_set(positions, position_values.data(), 0, position_values.size() * sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("RoPE cache graph compute failed");
+        ggml_backend_tensor_get(reference, expected.data(), 0, count * sizeof(float));
+        ggml_backend_tensor_get(destination_storage, actual.data(), 0, actual.size() * sizeof(float));
+        if (actual.front() != (overlap ? values.front() : guards.front()) || actual.back() != guards.back() ||
+            !std::equal(expected.begin(), expected.end(), actual.begin() + 1))
+            throw std::runtime_error("RoPE cache copy changed values or adjacent storage");
+        if (exposed || shared) {
+            std::vector<float> observed(count);
+            ggml_backend_tensor_get(exposed ? candidate : consumer, observed.data(), 0, count * sizeof(float));
+            for (int i = 0; i < count; ++i) {
+                if (observed[i] != (exposed ? expected[i] : expected[i] * 0.5f))
+                    throw std::runtime_error("RoPE cache fusion discarded an observable intermediate");
+            }
+        }
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(inputs);
+    }
+    ggml_backend_free(cpu);
+}
+
 int main() {
     auto backend=ggml_backend_metal_init();
     if(!backend) return 2;
@@ -471,6 +556,7 @@ int main() {
     matvec_add_q8_regression(backend);
     optimizer_alias_ordering(backend);
     flash_attention_tail_regression(backend);
+    rope_cache_copy_regression(backend);
     ggml_backend_free(backend);
     std::cout<<"Metal padding, convolution and Q8 fusion parity passed\n";
 }

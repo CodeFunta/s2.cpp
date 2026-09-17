@@ -1,0 +1,104 @@
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -369,6 +369,24 @@
+ 
+ }
+ 
++bool ggml_metal_can_fuse_rope_cpy(const ggml_cgraph * gf, int first, int second) {
++    const auto * rope = gf->nodes[first];
++    const auto * dst = gf->nodes[second];
++    if (rope->op != GGML_OP_ROPE || dst->op != GGML_OP_CPY) return false;
++    const int indices[] = {first, second};
++    const ggml_op ops[] = {GGML_OP_ROPE, GGML_OP_CPY};
++    if (rope->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        dst->src[0] != rope || !ggml_is_contiguous(dst) ||
++        !ggml_can_fuse_ext(gf, indices, ops, 2)) return false;
++    const auto pd = reinterpret_cast<uintptr_t>(dst->data);
++    for (const auto * src : rope->src) {
++        if (!src) continue;
++        const auto ps = reinterpret_cast<uintptr_t>(src->data);
++        if (ps <= pd ? pd - ps < ggml_nbytes(src) : ps - pd < ggml_nbytes(dst)) return false;
++    }
++    return true;
++}
++
+ void ggml_graph_optimize(ggml_cgraph * gf) {
+     constexpr int MAX_FUSE = 16;
+ 
+@@ -390,9 +408,11 @@
+ 
+         // fuse only ops that start with these operations
+         // can be expanded when needed
+-        if (node.op() == GGML_OP_ADD ||
+-            node.op() == GGML_OP_NORM ||
+-            node.op() == GGML_OP_RMS_NORM) {
++        if (i + 1 < n && ggml_metal_can_fuse_rope_cpy(gf, i, i + 1)) {
++            node.add_fused(gf->nodes[++i]);
++        } else if (node.op() == GGML_OP_ADD ||
++                   node.op() == GGML_OP_NORM ||
++                   node.op() == GGML_OP_RMS_NORM) {
+             ops[0] = node.op();
+ 
+             int f = i + 1;
+--- a/ggml/src/ggml-metal/ggml-metal-common.h
++++ b/ggml/src/ggml-metal/ggml-metal-common.h
+@@ -41,6 +41,8 @@
+ // - new dst range overlaps with any existing range (src or dst)
+ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
+ 
++bool ggml_metal_can_fuse_rope_cpy(const struct ggml_cgraph * gf, int first, int second);
++
+ // reorder the nodes in the graph to improve concurrency, while respecting fusion
+ //
+ // note: this implementation is generic and not specific to metal
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -94,6 +94,11 @@
+         if (i0 + n_ops > n_nodes()) return false;
+         const int output = idxs[i0 + n_ops - 1];
+         return ggml_can_fuse_subgraph_ext(gf, idxs.data() + i0, n_ops, ops, &output, 1);
++    }
++
++    bool can_fuse_rope_cpy(int i) const {
++        return use_fusion && i + 1 < n_nodes() &&
++            ggml_metal_can_fuse_rope_cpy(gf, idxs[i], idxs[i + 1]);
+     }
+ 
+     ggml_metal_device_t  dev;
+@@ -3587,6 +3592,11 @@
+ 
+ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
++    ggml_tensor * dst = op;
++    if (ctx->can_fuse_rope_cpy(idx)) {
++        dst = ctx->node(idx + 1);
++        if (!ggml_metal_op_concurrency_check(ctx, dst)) ggml_metal_op_concurrency_reset(ctx);
++    }
+ 
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+@@ -3595,8 +3605,8 @@
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++    GGML_TENSOR_LOCALS( int32_t, ne,  dst,        ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb,  dst,        nb);
+ 
+     // make sure we have one or more position id(ne10) per token(ne02)
+     GGML_ASSERT(ne10 % ne02 == 0);
+@@ -3674,11 +3684,11 @@
+     } else {
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 3);
+     }
+-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        4);
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+ 
+-    return 1;
++    return dst != op ? 2 : 1;
+ }
+ 
+ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
