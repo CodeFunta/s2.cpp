@@ -2,6 +2,7 @@
 #include "../third_party/filesystem.hpp"
 
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
 
@@ -12,7 +13,18 @@ namespace s2 {
 static const char MAGIC[8] = {'S', '2', 'V', 'O', 'I', 'C', 'E', '\0'};
 static const uint32_t VERSION = 1;
 
+static bool valid_shape(int32_t books, int32_t frames, int32_t rate, int32_t vocabulary,
+                        uint64_t code_count) {
+    return books > 0 && frames > 0 && rate > 0 && vocabulary > 0 &&
+           code_count == uint64_t(books)*uint64_t(frames);
+}
+
 bool VoiceProfile::save(const std::string & path) const {
+    if (transcript.empty() || transcript.find('\0') != std::string::npos ||
+        !valid_shape(num_codebooks, T_prompt, sample_rate, codebook_size, codes.size()) ||
+        std::any_of(codes.begin(), codes.end(), [&](int32_t code) {
+            return code < 0 || code >= codebook_size;
+        })) return false;
     std::ofstream out(path, std::ios::binary);
     if (!out) {
         return false;
@@ -36,6 +48,7 @@ bool VoiceProfile::save(const std::string & path) const {
     out.write(transcript.c_str(), static_cast<std::streamsize>(transcript_len));
     out.write(reinterpret_cast<const char*>(codes.data()), static_cast<std::streamsize>(codes_size));
 
+    out.flush();
     return out.good();
 }
 
@@ -44,6 +57,14 @@ VoiceProfile VoiceProfile::load(const std::string & path) {
     if (!in) {
         throw std::runtime_error("cannot open voice profile: " + path);
     }
+    constexpr uint64_t header_size = 8 + 5*sizeof(uint32_t) + 2*sizeof(uint64_t);
+    in.seekg(0, std::ios::end);
+    const auto file_size = in.tellg();
+    if (file_size < std::streamoff(header_size)) {
+        throw std::runtime_error("truncated voice profile header");
+    }
+    const uint64_t payload_size = uint64_t(file_size) - header_size;
+    in.seekg(0);
 
     char magic[8];
     in.read(magic, sizeof(magic));
@@ -69,20 +90,26 @@ VoiceProfile VoiceProfile::load(const std::string & path) {
     uint64_t codes_size = 0;
     in.read(reinterpret_cast<char*>(&codes_size), sizeof(codes_size));
 
-    if (transcript_len == 0) {
-        throw std::runtime_error("invalid voice profile transcript length");
+    if (!in || transcript_len < 2 || transcript_len > payload_size ||
+        codes_size != payload_size - transcript_len || codes_size % sizeof(int32_t) != 0 ||
+        !valid_shape(profile.num_codebooks, profile.T_prompt, profile.sample_rate,
+                     profile.codebook_size, codes_size / sizeof(int32_t))) {
+        throw std::runtime_error("invalid voice profile dimensions");
     }
-
-    std::vector<char> transcript_buf(static_cast<size_t>(transcript_len));
-    in.read(transcript_buf.data(), static_cast<std::streamsize>(transcript_len));
-    if (transcript_buf.back() != '\0') {
-        throw std::runtime_error("transcript not null-terminated");
+    profile.transcript.resize(static_cast<size_t>(transcript_len - 1));
+    in.read(&profile.transcript[0], static_cast<std::streamsize>(transcript_len - 1));
+    char terminator = 0;
+    in.get(terminator);
+    if (terminator != '\0' || profile.transcript.find('\0') != std::string::npos) {
+        throw std::runtime_error("invalid voice profile transcript");
     }
-    profile.transcript = transcript_buf.data();
-
-    const size_t n_codes = static_cast<size_t>(codes_size / sizeof(int32_t));
-    profile.codes.resize(n_codes);
+    profile.codes.resize(static_cast<size_t>(codes_size / sizeof(int32_t)));
     in.read(reinterpret_cast<char*>(profile.codes.data()), static_cast<std::streamsize>(codes_size));
+    if (std::any_of(profile.codes.begin(), profile.codes.end(), [&](int32_t code) {
+        return code < 0 || code >= profile.codebook_size;
+    })) {
+        throw std::runtime_error("invalid voice profile code");
+    }
 
     if (!in) {
         throw std::runtime_error("truncated voice profile");

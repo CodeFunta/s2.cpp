@@ -730,6 +730,33 @@ bool Pipeline::synthesize_to_memory(const PipelineParams & params, const void * 
     return true;
 }
 
+bool Pipeline::load_prompt_codes(const std::string & path, const std::string & transcript,
+                                 std::vector<int32_t> & codes_out, int32_t & n_frames_out) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    if (!initialized_) return false;
+    auto profile = VoiceProfile::load(path);
+    if (!profile.is_compatible(model().hparams().num_codebooks,
+                               model().hparams().codebook_size, codec().sample_rate()) ||
+        profile.transcript != transcript) return false;
+    codes_out = std::move(profile.codes);
+    n_frames_out = profile.T_prompt;
+    return true;
+}
+
+bool Pipeline::save_prompt_codes(const std::string & path, const std::string & transcript,
+                                 const std::vector<int32_t> & codes, int32_t n_frames) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    if (!initialized_) return false;
+    VoiceProfile profile;
+    profile.transcript = transcript;
+    profile.codes = codes;
+    profile.num_codebooks = model().hparams().num_codebooks;
+    profile.T_prompt = n_frames;
+    profile.sample_rate = codec().sample_rate();
+    profile.codebook_size = model().hparams().codebook_size;
+    return profile.save(path);
+}
+
 bool Pipeline::encode_prompt_audio(const std::string & audio_path, int32_t n_threads,
                                    std::vector<int32_t> & codes_out, int32_t & n_frames_out) {
     std::lock_guard<std::mutex> lock(synthesize_mutex_);

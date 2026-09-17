@@ -352,7 +352,7 @@ You can also load the same voice by id instead of by path:
 --voice hope --voice-dir /path/to/voices
 ```
 
-Updated native C# P/Invoke example: [`examples/csharp`](examples/csharp) contains a current sample project that binds every exported symbol, including `InitializeS2PipelineFromFiles()`, `S2SynthesizeStreaming()`, and `S2SynthesizeStreamingEx()` with low-latency, sentence segmentation, and saved `.s2voice` selection. Its local README also compares the current API surface against the original modular design proposed by SubSpecs.
+Updated native C# P/Invoke example: [`examples/csharp`](examples/csharp) binds the model-initialization and synthesis exports, including `InitializeS2PipelineFromFiles()`, `S2SynthesizeStreaming()`, and `S2SynthesizeStreamingEx()` with low-latency, sentence segmentation, and saved `.s2voice` selection. Its local README also compares that API surface against the original modular design proposed by SubSpecs.
 
 Go CGo example: [`examples/golang`](examples/golang) mirrors the C# example with the same five flows (smoke, from-files, modular, legacy-stream, stream-ex) using runtime `dlopen` loading — no build-time dependency on `libs2`. Streaming callbacks use `//export` Go functions with `sync.Map` for session state, equivalent to the C# `GCHandle` pattern.
 
@@ -401,6 +401,15 @@ By default, the engine uses fish-speech-aligned sampling defaults: `--min-tokens
 ### Voice profile persistence
 
 You can persist encoded reference codes as reusable `.s2voice` profiles so repeated cloning requests do not need to re-encode the same reference audio.
+
+Library hosts can persist an existing `AllocS2AudioPromptCodes` handle with
+`SaveS2AudioPromptCodes(pipeline, path, transcript, codes, frames)` and restore it
+with `LoadS2AudioPromptCodes(pipeline, path, expected_transcript, codes, &frames)`.
+Neither call synthesizes audio or encodes a reference. Load checks native
+metadata, payload bounds, and the expected transcript before replacing outputs;
+failed loads leave the caller's codes and frame count unchanged. Both return
+`1` on success, `0` for invalid arguments, and `-1` for I/O or invalid/incompatible
+profiles. Hosts own cache identity, private permissions, and atomic publication.
 
 Save a profile while cloning:
 

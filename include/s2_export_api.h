@@ -89,6 +89,15 @@ extern "C"
                                              const char* ReferenceAudioPath,
                                              std::vector<int32_t>* AudioPromptCodes,
                                              int32_t* TPrompt);
+    // Native .s2voice persistence. Returns 1 on success, 0 for invalid arguments,
+    // -1 for I/O, malformed/incompatible profiles or transcript mismatch.
+    // Load leaves caller-owned Codes/TPrompt unchanged on failure.
+    S2_Export int LoadS2AudioPromptCodes(s2::Pipeline* Pipeline, const char* ProfilePath,
+                                       const char* ReferenceText, std::vector<int32_t>* Codes,
+                                       int32_t* TPrompt);
+    S2_Export int SaveS2AudioPromptCodes(s2::Pipeline* Pipeline, const char* ProfilePath,
+                                       const char* ReferenceText, const std::vector<int32_t>* Codes,
+                                       int32_t TPrompt);
 
     S2_Export std::vector<float>* AllocS2AudioBuffer(int InitialSize);
     S2_Export void ReleaseS2AudioBuffer(std::vector<float>* AudioBuffer);

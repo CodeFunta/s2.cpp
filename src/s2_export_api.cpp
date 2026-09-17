@@ -542,6 +542,30 @@ int InitializeAudioPromptCodes(s2::Pipeline* Pipeline, int32_t ThreadCount,
                                          *AudioPromptCodes, *TPrompt) ? 1 : -1;
 }
 
+int LoadS2AudioPromptCodes(s2::Pipeline* Pipeline, const char* ProfilePath,
+                           const char* ReferenceText, std::vector<int32_t>* Codes,
+                           int32_t* TPrompt) {
+    if (!Pipeline || !Pipeline->is_initialized() || !has_value(ProfilePath) ||
+        !has_value(ReferenceText) || !Codes || !TPrompt) return 0;
+    try {
+        return Pipeline->load_prompt_codes(ProfilePath, ReferenceText, *Codes, *TPrompt) ? 1 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int SaveS2AudioPromptCodes(s2::Pipeline* Pipeline, const char* ProfilePath,
+                           const char* ReferenceText, const std::vector<int32_t>* Codes,
+                           int32_t TPrompt) {
+    if (!Pipeline || !Pipeline->is_initialized() || !has_value(ProfilePath) ||
+        !has_value(ReferenceText) || !Codes || TPrompt <= 0) return 0;
+    try {
+        return Pipeline->save_prompt_codes(ProfilePath, ReferenceText, *Codes, TPrompt) ? 1 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
 std::vector<float>* AllocS2AudioBuffer(int InitialSize) {
     return InitialSize > 0 ? new std::vector<float>(static_cast<size_t>(InitialSize))
                            : new std::vector<float>();
