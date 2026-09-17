@@ -45,7 +45,7 @@ ctest --test-dir build --output-on-failure
 All ggml changes are reproducible patches under `patches/`, applied by the
 existing CMake patch target. Do not distribute only a dirty submodule checkout.
 Without `S2_TEST_MODEL`, the model-dependent binaries build but only the
-model-independent Metal padding/convolution and sampler tests are registered with CTest.
+model-independent Metal operator and sampler tests are registered with CTest.
 
 For actual frame streaming, select `--metal --gpu-layers -1
 --codec-follow-backend` and use `stream=true`, `chunked=true`,
@@ -102,6 +102,13 @@ Q/K/V slices that are already contiguous remain views of the combined projection
 This avoids redundant copies during single-token slow/fast decoding; multi-token
 prefill still materializes strided slices. GGML tracks the shared storage through
 all consumers, including the existing post-attention history rounding.
+
+For contiguous Q8_0 single-token FFNs, Metal combines the gate/up projections
+and split SwiGLU into one dispatch, without packing weights or materializing
+the intermediate projections. Per-row dot products, reduction order, and
+SwiGLU arithmetic are unchanged. Batched inputs, distinct projection inputs,
+and externally consumed intermediate projections retain the ordinary path.
+Fusion also checks encoder boundaries, output aliases, and prior memory hazards.
 
 CPU sampling radix-sorts large finite vocabularies without changing the full
 softmax reduction order, top-p-before-temperature filtering, or RNG consumption.

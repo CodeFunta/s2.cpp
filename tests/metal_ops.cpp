@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -67,6 +68,109 @@ static void left_pad(ggml_backend_t backend) {
     ggml_backend_buffer_free(b); ggml_free(ctx);
 }
 
+static void swiglu_q8_regression(ggml_backend_t backend) {
+    constexpr int64_t k = 1024;
+    constexpr int64_t rows = 7;
+    for (int64_t ncols : { int64_t(1), int64_t(2) }) {
+        for (int scenario = 0; scenario < (ncols == 1 ? 4 : 1); ++scenario) {
+            const bool requested_gate = scenario == 1;
+            const bool add_consumer = scenario == 2;
+            const bool distinct_up_input = scenario == 3;
+            auto *ctx = ggml_init({1 << 22, nullptr, true});
+            if (!ctx) throw std::runtime_error("SwiGLU context allocation failed");
+
+            auto *wg = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, rows);
+            auto *wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, rows);
+            auto *x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+            auto *x_up = distinct_up_input ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols) : x;
+            auto *ref_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+            auto *ref_x_up = distinct_up_input ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols) : ref_x;
+
+            std::vector<float> gate_weights(k * rows), up_weights(k * rows);
+            std::vector<float> input(k * ncols), up_input(k * ncols);
+            for (size_t i = 0; i < gate_weights.size(); ++i) {
+                gate_weights[i] = 0.11f * std::sin(float(i) * 0.017f) + 0.03f;
+                up_weights[i] = -0.09f * std::cos(float(i) * 0.023f) + 0.02f;
+            }
+            for (size_t i = 0; i < input.size(); ++i) {
+                input[i] = 0.17f + 0.13f * std::sin(float(i) * 0.031f);
+                up_input[i] = -0.21f + 0.08f * std::cos(float(i) * 0.019f);
+            }
+            std::vector<uint8_t> qgate(ggml_nbytes(wg)), qup(ggml_nbytes(wu));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, gate_weights.data(), qgate.data(), 0, rows, k, nullptr);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, up_weights.data(), qup.data(), 0, rows, k, nullptr);
+
+            auto *ref_gate = ggml_mul_mat(ctx, wg, ref_x);
+            auto *ref_up = ggml_mul_mat(ctx, wu, ref_x_up);
+            auto *ref_result = ggml_swiglu_split(ctx, ref_gate, ref_up);
+            auto *ref_add = add_consumer ? ggml_add(ctx, ref_gate, ref_up) : nullptr;
+            ggml_set_output(ref_gate);
+            ggml_set_output(ref_up);
+            ggml_set_output(ref_result);
+            if (ref_add) ggml_set_output(ref_add);
+
+            auto *candidate_gate = ggml_mul_mat(ctx, wg, x);
+            auto *candidate_up = ggml_mul_mat(ctx, wu, x_up);
+            auto *candidate_result = ggml_swiglu_split(ctx, candidate_gate, candidate_up);
+            ggml_set_output(candidate_result);
+            if (requested_gate) {
+                ggml_set_output(candidate_gate);
+            }
+            auto *candidate_add = add_consumer ? ggml_add(ctx, candidate_gate, candidate_up) : nullptr;
+            if (candidate_add) ggml_set_output(candidate_add);
+            auto *graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, ref_result);
+            if (ref_add) ggml_build_forward_expand(graph, ref_add);
+            ggml_build_forward_expand(graph, candidate_result);
+            if (candidate_add) ggml_build_forward_expand(graph, candidate_add);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buffer) throw std::runtime_error("SwiGLU allocation failed");
+            ggml_backend_tensor_set(wg, qgate.data(), 0, qgate.size());
+            ggml_backend_tensor_set(wu, qup.data(), 0, qup.size());
+            std::vector<float> unwritten(rows * ncols, std::numeric_limits<float>::quiet_NaN());
+            ggml_backend_tensor_set(candidate_gate, unwritten.data(), 0, unwritten.size() * sizeof(float));
+            ggml_backend_tensor_set(candidate_up, unwritten.data(), 0, unwritten.size() * sizeof(float));
+            ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(ref_x, input.data(), 0, input.size() * sizeof(float));
+            if (distinct_up_input) {
+                ggml_backend_tensor_set(x_up, up_input.data(), 0, up_input.size() * sizeof(float));
+                ggml_backend_tensor_set(ref_x_up, up_input.data(), 0, up_input.size() * sizeof(float));
+            }
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("SwiGLU compute failed");
+
+            const size_t result_size = size_t(ggml_nelements(ref_result));
+            std::vector<float> expected(result_size), actual(result_size);
+            ggml_backend_tensor_get(ref_result, expected.data(), 0, expected.size() * sizeof(float));
+            ggml_backend_tensor_get(candidate_result, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < result_size; ++i) {
+                if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) || expected[i] != actual[i])
+                    throw std::runtime_error("Q8 SwiGLU result differs from unfused reference");
+            }
+            if (requested_gate) {
+                std::vector<float> expected_gate(ggml_nelements(ref_gate)), actual_gate(ggml_nelements(candidate_gate));
+                ggml_backend_tensor_get(ref_gate, expected_gate.data(), 0, expected_gate.size() * sizeof(float));
+                ggml_backend_tensor_get(candidate_gate, actual_gate.data(), 0, actual_gate.size() * sizeof(float));
+                for (size_t i = 0; i < expected_gate.size(); ++i) {
+                    if (!std::isfinite(expected_gate[i]) || !std::isfinite(actual_gate[i]) || expected_gate[i] != actual_gate[i])
+                        throw std::runtime_error("requested Q8 SwiGLU gate output differs");
+                }
+            }
+            if (candidate_add) {
+                std::vector<float> expected_add(ggml_nelements(ref_add)), actual_add(ggml_nelements(candidate_add));
+                ggml_backend_tensor_get(ref_add, expected_add.data(), 0, expected_add.size() * sizeof(float));
+                ggml_backend_tensor_get(candidate_add, actual_add.data(), 0, actual_add.size() * sizeof(float));
+                for (size_t i = 0; i < expected_add.size(); ++i) {
+                    if (!std::isfinite(expected_add[i]) || !std::isfinite(actual_add[i]) || actual_add[i] != expected_add[i])
+                        throw std::runtime_error("unmarked Q8 SwiGLU projection consumer differs");
+                }
+            }
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+}
+
 int main() {
     auto backend=ggml_backend_metal_init();
     if(!backend) return 2;
@@ -78,6 +182,7 @@ int main() {
         }
         transpose_conv(backend,1536,8,16,8,type);
     }
+    swiglu_q8_regression(backend);
     ggml_backend_free(backend);
-    std::cout<<"Metal padding and convolution parity passed\n";
+    std::cout<<"Metal padding, convolution and Q8 SwiGLU parity passed\n";
 }
