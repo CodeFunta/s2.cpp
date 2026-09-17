@@ -73,7 +73,7 @@ static ggml_tensor * rms_norm_weighted(ggml_context * ctx, ggml_tensor * x,
     if (w->type != cur->type) {
         w = ggml_cast(ctx, w, cur->type);
     }
-    w = repeat_checked(ctx, w, cur, "repeat:rms_norm");
+    // MUL broadcasts the weights; materializing a REPEAT adds a GPU dispatch.
     return ggml_mul(ctx, cur, w);
 }
 

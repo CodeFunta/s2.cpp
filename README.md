@@ -120,6 +120,14 @@ Metal CONCAT and non-quantized SET/CPY batch narrow rows into threadgroups
 capped at 256 threads. Each destination element remains an independent copy;
 quantized copies retain their existing one-row dispatch.
 
+F32 vector attention reads partial KV tiles directly, substituting the same
+padding zeros and half-precision mask values without a separate padding pass.
+For eligible caches of at most 32 keys, one workgroup also performs the original
+32-lane final reduction, including its neutral lanes. Other attention paths
+retain their existing kernels. RMS normalization broadcasts weights instead
+of materializing repeated tensors. Operator regressions cover scalar-aligned
+and strided KV views, tail boundaries, batches, masks, bias, softcap, and sinks.
+
 CPU sampling radix-sorts large finite vocabularies without changing the full
 softmax reduction order, top-p-before-temperature filtering, or RNG consumption.
 Small vocabularies and nonfinite values retain comparison sorting. If equal

@@ -1,0 +1,147 @@
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2989,8 +2989,11 @@
+         bool need_sync = false;
+ 
+         const bool has_kvpad = ne11 % ncpsg != 0;
+-
+-        if (has_kvpad) {
++        // F32 vector attention loads tail zeros/masks directly, without a pad pass.
++        const bool direct_kv = op->src[1]->type == GGML_TYPE_F32 &&
++                               op->src[2]->type == GGML_TYPE_F32;
++
++        if (has_kvpad && !direct_kv) {
+             assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
+ 
+             ggml_metal_kargs_flash_attn_ext_pad args0 = {
+@@ -3097,6 +3100,8 @@
+             /*.logit_softcap =*/ logit_softcap,
+         };
+ 
++        // Retain the 32-lane reduction arithmetic inside the sole live partition.
++        const int32_t nactive = direct_kv && nsg == 1 && ne11 > 0 && ne11 <= ncpsg ? 1 : nwg;
+         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+ 
+         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+@@ -3114,8 +3119,7 @@
+         //printf("smem: %zu, max: %zu, nsg = %d, nsgmax = %d\n", smem, props_dev->max_theadgroup_memory_size, (int) nsg, (int) nsgmax);
+         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+ 
+-        if (nwg == 1) {
+-            assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) == 0);
++        if (nactive == 1) {
+ 
+             // using 1 workgroup -> write the result directly into dst
+             ggml_metal_encoder_set_buffer(enc, bid_pad, 6);
+@@ -3123,7 +3127,7 @@
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nactive, 32, nsg, 1);
+         } else {
+             // sanity checks
+             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+@@ -3136,7 +3140,7 @@
+             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nactive, 32, nsg, 1);
+ 
+             // sync the 2 kernels
+             ggml_metal_op_concurrency_reset(ctx);
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -6896,9 +6896,12 @@
+ #define NS10 (FC_flash_attn_ext_vec_ns10)
+ #define NS20 (FC_flash_attn_ext_vec_ns20)
+ 
+-    const short iwg = tgpig[2]%NWG;
+-
+-    const ushort iq3 = tgpig[2]/NWG;
++    const bool direct_kv = is_same<kd4_t, float4>::value && is_same<vd4_t, float4>::value;
++    const short active_nwg = direct_kv &&
++                             NSG == 1 && args.ne11 > 0 && args.ne11 <= C ? 1 : NWG;
++    const short iwg = tgpig[2]%active_nwg;
++
++    const ushort iq3 = tgpig[2]/active_nwg;
+     const ushort iq2 = tgpig[1];
+     const ushort iq1 = tgpig[0];
+ 
+@@ -6997,7 +7000,7 @@
+             }
+ 
+             // the last partial chunk uses the pad buffer as source
+-            if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
++            if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11 && !direct_kv) {
+                 k    = pad;
+                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+@@ -7022,7 +7025,10 @@
+                 ic = 0;
+             }
+ 
+-            if (FC_flash_attn_ext_vec_has_mask) {
++            if (direct_kv) {
++                sm[tiisg] = ic + tiisg < args.ne11 ?
++                    (FC_flash_attn_ext_vec_has_mask ? pm[ic + tiisg] : half(0.0f)) : half(-MAXHALF);
++            } else if (FC_flash_attn_ext_vec_has_mask) {
+                 sm[tiisg] = pm[ic + tiisg];
+             }
+ 
+@@ -7045,7 +7051,13 @@
+                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                     if (is_same<kd4_t, k4_t>::value) {
+                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+-                            mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
++                            // F32 views may start at a scalar-aligned byte offset.
++                            const float4 key = direct_kv ?
++                                (ic + NE*cc + ty < args.ne11 ?
++                                    float4(*(device const packed_float4 *) (k +
++                                        (ic + NE*cc + ty)*args.nb11 + (tx + ii*NL)*sizeof(float4))) :
++                                    float4(0.0f)) : (float4) pk4[cc*NE*NS10/4 + ii*NL];
++                            mqk[cc] += dot(key, (float4) pq4[ii*NL]);
+                         }
+                     } else {
+                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
+@@ -7154,7 +7166,12 @@
+ 
+                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+-                            lo[ii] += o4_t(float4(pv4[cc*NE*NS20/4 + ii*NL])*float4(sst[cc*NE]));
++                            const float4 value = direct_kv ?
++                                (ic + NE*cc + ty < args.ne11 ?
++                                    float4(*(device const packed_float4 *) (v +
++                                        (ic + NE*cc + ty)*args.nb21 + (tx + ii*NL)*sizeof(float4))) :
++                                    float4(0.0f)) : float4(pv4[cc*NE*NS20/4 + ii*NL]);
++                            lo[ii] += o4_t(value*float4(sst[cc*NE]));
+                         }
+                     }
+                 } else {
+@@ -7274,6 +7291,25 @@
+         }
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    // Reproduce the standalone reducer lane-for-lane, including neutral lanes.
++    // Do not replace this with division of so4: that changes reduction semantics.
++    if (active_nwg == 1 && NWG > 1) {
++        const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
++        const float M = tiisg == 0 ? ss[1] : -FLT_MAX/2;
++        const float m = simd_max(M);
++        const float ms = exp(M - m);
++        float S = tiisg == 0 ? ss[0] : 0.0f;
++        S = simd_sum(S*ms);
++        S = S == 0.0f ? 0.0f : 1.0f/S;
++        device float4 * out = (device float4 *) dst + rid*DV4;
++        for (short i = 0; i < DV4; ++i) {
++            const float4 partial = tiisg == 0 ? (float4) so4[i] : float4(0.0f);
++            const float4 value = simd_sum(partial*ms);
++            if (tiisg == 0) out[i] = value*S;
++        }
++        return;
+     }
+ 
+     // final rescale with 1/S and store to global memory

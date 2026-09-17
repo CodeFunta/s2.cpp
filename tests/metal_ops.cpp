@@ -330,6 +330,132 @@ static void optimizer_alias_ordering(ggml_backend_t backend) {
     ggml_backend_free(cpu);
 }
 
+static void flash_attention_tail_regression(ggml_backend_t backend) {
+    struct Shape {
+        int dim, keys, queries, batches;
+        bool masked;
+        float bias = 0.0f, softcap = 0.0f;
+        bool sinks = false;
+        bool unaligned = false;
+    };
+    const Shape cases[] = {
+        {128, 2, 3, 2, false}, {128, 10, 2, 2, true},
+        {128, 32, 1, 1, false}, {128, 33, 1, 2, true},
+        {64, 65, 2, 2, false}, {96, 31, 3, 2, true},
+        {128, 2049, 1, 1, true}, {128, 129, 20, 1, true},
+        {128, 11, 3, 2, true, 0.7f, 2.0f, true},
+        {128, 7, 2, 2, true, 0.0f, 0.0f, false, true},
+    };
+    constexpr int heads = 4, kv_heads = 2, mask_heads = 2;
+    for (const auto & s : cases) {
+        auto * ctx = ggml_init({1 << 22, nullptr, true});
+        if (!ctx) throw std::runtime_error("attention context allocation failed");
+        auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, s.dim, s.queries, heads, s.batches);
+        // Interleave KV heads and leave poisoned rows outside the visible view.
+        const int kv_dim = s.dim + (s.unaligned ? 1 : 0);
+        auto make_kv = [&]() {
+            if (!s.unaligned)
+                return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, s.dim, kv_heads, s.keys + 2, s.batches);
+            auto * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                int64_t(kv_dim)*kv_heads*(s.keys + 2)*s.batches + 1);
+            return ggml_view_4d(ctx, storage, s.dim, kv_heads, s.keys + 2, s.batches,
+                kv_dim*sizeof(float), kv_dim*kv_heads*sizeof(float),
+                kv_dim*kv_heads*(s.keys + 2)*sizeof(float), sizeof(float));
+        };
+        auto * kb = make_kv();
+        auto * vb = make_kv();
+        auto view = [&](ggml_tensor * base) {
+            return ggml_permute(ctx, ggml_view_4d(ctx, base, s.dim, kv_heads, s.keys, s.batches,
+                base->nb[1], base->nb[2], base->nb[3], base->nb[2]), 0, 2, 1, 3);
+        };
+        auto * k = view(kb);
+        auto * v = view(vb);
+        auto * mask = s.masked ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16,
+            s.keys, s.queries, mask_heads, s.batches) : nullptr;
+        const float scale = 1.0f/std::sqrt(float(s.dim));
+        auto * result = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, s.bias, s.softcap);
+        auto * sinks = s.sinks ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads) : nullptr;
+        if (sinks) ggml_flash_attn_ext_add_sinks(result, sinks);
+        ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, result);
+        auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buffer) throw std::runtime_error("attention allocation failed");
+        std::vector<float> qv(ggml_nelements(q));
+        std::vector<float> kval(ggml_nbytes(kb)/sizeof(float), std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> vval(kval.size(), std::numeric_limits<float>::quiet_NaN());
+        auto qi = [&](int d, int query, int head, int batch) {
+            return d + s.dim*(query + s.queries*(head + heads*batch));
+        };
+        auto ki = [&](int d, int key, int head, int batch) {
+            return d + kv_dim*(head + kv_heads*(key + 1 + (s.keys + 2)*batch));
+        };
+        for (size_t i = 0; i < qv.size(); ++i) qv[i] = float(int(i%19) - 9)/32.0f;
+        for (int b = 0; b < s.batches; ++b)
+            for (int h = 0; h < kv_heads; ++h)
+                for (int t = 0; t < s.keys; ++t)
+                    for (int d = 0; d < s.dim; ++d) {
+                        kval[ki(d,t,h,b)] = float((d + 3*t + 5*h + 7*b)%23 - 11)/64.0f;
+                        vval[ki(d,t,h,b)] = float((5*d + 7*t + 3*h + b)%29 - 14)/16.0f;
+                    }
+        auto masked = [&](int t, int query, int head, int batch) {
+            return s.masked && ((head%mask_heads == 1 && query == 0) ||
+                (t + query + head%mask_heads + batch)%5 == 0);
+        };
+        ggml_backend_tensor_set(q, qv.data(), 0, qv.size()*sizeof(float));
+        ggml_backend_tensor_set(kb, kval.data(), 0, kval.size()*sizeof(float));
+        ggml_backend_tensor_set(vb, vval.data(), 0, vval.size()*sizeof(float));
+        const float sink_values[heads] = {-0.5f, 0.0f, 0.5f, 1.0f};
+        if (sinks) ggml_backend_tensor_set(sinks, sink_values, 0, sizeof(sink_values));
+        auto mask_value = [&](int t, int query, int head, int batch) {
+            if (masked(t, query, head, batch)) return -INFINITY;
+            return s.bias != 0.0f ? -float(t%3)/8.0f : 0.0f;
+        };
+        if (mask) {
+            std::vector<ggml_fp16_t> mv(ggml_nelements(mask));
+            for (int b = 0; b < s.batches; ++b)
+                for (int h = 0; h < mask_heads; ++h)
+                    for (int query = 0; query < s.queries; ++query)
+                        for (int t = 0; t < s.keys; ++t)
+                            mv[t + s.keys*(query + s.queries*(h + mask_heads*b))] =
+                                ggml_fp32_to_fp16(mask_value(t,query,h,b));
+            ggml_backend_tensor_set(mask, mv.data(), 0, mv.size()*sizeof(ggml_fp16_t));
+        }
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("attention compute failed");
+        std::vector<float> actual(ggml_nelements(result));
+        ggml_backend_tensor_get(result, actual.data(), 0, actual.size()*sizeof(float));
+        for (int b = 0; b < s.batches; ++b)
+            for (int h = 0; h < heads; ++h)
+                for (int query = 0; query < s.queries; ++query) {
+                    std::vector<double> weights(s.keys, 0.0);
+                    double denom = s.sinks ? std::exp(double(sink_values[h])) : 0.0;
+                    for (int t = 0; t < s.keys; ++t) {
+                        if (masked(t,query,h,b)) continue;
+                        double dot = 0.0;
+                        for (int d = 0; d < s.dim; ++d)
+                            dot += double(qv[qi(d,query,h,b)])*kval[ki(d,t,h/2,b)];
+                        double score = s.softcap != 0.0f ? s.softcap*std::tanh(dot*scale/s.softcap) : dot*scale;
+                        const double slope = s.bias != 0.0f ? std::pow(2.0, -double(s.bias)*(h + 1)/heads) : 1.0;
+                        score += mask_value(t,query,h,b)*slope;
+                        weights[t] = std::exp(score);
+                        denom += weights[t];
+                    }
+                    for (int d = 0; d < s.dim; ++d) {
+                        double expected = 0.0;
+                        for (int t = 0; t < s.keys; ++t)
+                            expected += weights[t]*vval[ki(d,t,h/2,b)];
+                        if (denom != 0.0) expected /= denom;
+                        const float got = actual[d + s.dim*(h + heads*(query + s.queries*b))];
+                        if (!(std::abs(double(got) - expected) <= 2e-4))
+                            throw std::runtime_error("attention tail/mask/batch mismatch");
+                    }
+                }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+}
+
 int main() {
     auto backend=ggml_backend_metal_init();
     if(!backend) return 2;
@@ -344,6 +470,7 @@ int main() {
     swiglu_q8_regression(backend);
     matvec_add_q8_regression(backend);
     optimizer_alias_ordering(backend);
+    flash_attention_tail_regression(backend);
     ggml_backend_free(backend);
     std::cout<<"Metal padding, convolution and Q8 fusion parity passed\n";
 }
