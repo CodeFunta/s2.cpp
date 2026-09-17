@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "ggml-metal.h"
+#include "ggml-cpu.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -171,6 +172,69 @@ static void swiglu_q8_regression(ggml_backend_t backend) {
     }
 }
 
+static void optimizer_alias_ordering(ggml_backend_t backend) {
+    auto cpu = ggml_backend_cpu_init();
+    if (!cpu) throw std::runtime_error("CPU fallback initialization failed");
+    ggml_backend_t backends[] = {backend, cpu};
+    for (bool fused : {false, true}) {
+        auto * inputs = ggml_init({1 << 16, nullptr, true});
+        auto * x = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 8);
+        // Gaps prevent unrelated inputs from touching at interval endpoints.
+        ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 32);
+        auto * z = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 4);
+        ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 32);
+        auto * constant = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 4);
+        ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 32);
+        auto * replacement = ggml_new_tensor_1d(inputs, GGML_TYPE_F32, 4);
+        auto buffer = ggml_backend_alloc_ctx_tensors(inputs, backend);
+        if (!buffer) throw std::runtime_error("alias input allocation failed");
+
+        auto * ctx = ggml_init({1 << 20, nullptr, true});
+        auto * alias = ggml_view_1d(ctx, x, 4, 4 * sizeof(float));
+        // External input view: a VIEW operation would itself mask the hazard.
+        alias->op = GGML_OP_NONE;
+        auto * p = ggml_scale(ctx, z, 2.0f);
+        auto * result = ggml_add(ctx, p, fused ? constant : alias);
+        if (fused) result = ggml_mul(ctx, result, alias);
+        auto * overwrite = ggml_cpy(ctx, replacement, alias);
+        ggml_set_output(result);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, result);
+        // No tensor edge orders this write after the earlier read of X.
+        ggml_build_forward_expand(graph, overwrite);
+        auto sched = ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(graph), false, true);
+        if (!ggml_backend_sched_alloc_graph(sched, graph)) throw std::runtime_error("alias graph allocation failed");
+        for (int pass = 0; pass < 2; ++pass) {
+            float original[8], z_values[4], constants[4], replacements[4], output[4], after[8];
+            for (int i = 0; i < 8; ++i) original[i] = float(10 + 20 * pass + i);
+            for (int i = 0; i < 4; ++i) {
+                z_values[i] = float(i + 3);
+                constants[i] = float(2 * i + 1);
+                replacements[i] = float(100 + 20 * pass + i);
+            }
+            ggml_backend_tensor_set(x, original, 0, sizeof(original));
+            ggml_backend_tensor_set(z, z_values, 0, sizeof(z_values));
+            ggml_backend_tensor_set(constant, constants, 0, sizeof(constants));
+            ggml_backend_tensor_set(replacement, replacements, 0, sizeof(replacements));
+            if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("alias graph compute failed");
+            ggml_backend_tensor_get(result, output, 0, sizeof(output));
+            ggml_backend_tensor_get(x, after, 0, sizeof(after));
+            for (int i = 0; i < 4; ++i) {
+                const float expected = fused ? (2 * z_values[i] + constants[i]) * original[i + 4]
+                                             : 2 * z_values[i] + original[i + 4];
+                if (output[i] != expected || after[i] != original[i] || after[i + 4] != replacements[i])
+                    throw std::runtime_error(fused ? "optimizer reordered a fused alias read" : "optimizer reordered an alias read");
+            }
+        }
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(inputs);
+    }
+    ggml_backend_free(cpu);
+}
+
 int main() {
     auto backend=ggml_backend_metal_init();
     if(!backend) return 2;
@@ -183,6 +247,7 @@ int main() {
         transpose_conv(backend,1536,8,16,8,type);
     }
     swiglu_q8_regression(backend);
+    optimizer_alias_ordering(backend);
     ggml_backend_free(backend);
     std::cout<<"Metal padding, convolution and Q8 SwiGLU parity passed\n";
 }

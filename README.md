@@ -110,6 +110,12 @@ SwiGLU arithmetic are unchanged. Batched inputs, distinct projection inputs,
 and externally consumed intermediate projections retain the ordinary path.
 Fusion also checks encoder boundaries, output aliases, and prior memory hazards.
 
+Metal graph reordering resolves memory intervals once per optimizer invocation
+and checks reads only against accumulated writes. Writes still check both reads
+and writes, including fused inputs and aliased views. The interval cache is
+temporary; graph ordering, overlap boundaries, and numerical operations are
+unchanged.
+
 CPU sampling radix-sorts large finite vocabularies without changing the full
 softmax reduction order, top-p-before-temperature filtering, or RNG consumption.
 Small vocabularies and nonfinite values retain comparison sorting. If equal

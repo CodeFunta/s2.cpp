@@ -1,0 +1,155 @@
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -188,6 +188,8 @@
+     ggml_tensor * node;
+ 
+     std::vector<ggml_tensor *> fused;
++    size_t range_begin = 0;
++    size_t range_end = 0;
+ 
+     ggml_op op() const {
+         return node->op;
+@@ -205,53 +207,52 @@
+         fused.push_back(t);
+     }
+ };
+-
+-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
+-    // helper to add node src and dst ranges
+-    const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
+-        for (int i = 0; i < GGML_MAX_SRC; i++) {
+-            if (node.node->src[i]) {
+-                if (!ggml_mem_ranges_add_src(mrs, node.node->src[i])) {
+-                    return false;
+-                }
+-            }
+-        }
+-
+-        // keep track of the sources of the fused nodes as well
+-        for (const auto * fused : node.fused) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
+-                if (fused->src[i]) {
+-                    if (!ggml_mem_ranges_add_src(mrs, fused->src[i])) {
+-                        return false;
+-                    }
+-                }
+-            }
+-        }
+-
+-        return ggml_mem_ranges_add_dst(mrs, node.dst());
++struct node_range_set {
++    ggml_mem_ranges sources;
++    ggml_mem_ranges destinations;
++
++    node_range_set() {
++        sources.ranges.reserve(256);
++        destinations.ranges.reserve(256);
++    }
++
++    void reset() {
++        sources.ranges.clear();
++        destinations.ranges.clear();
++    }
++};
++
++static std::vector<int> ggml_metal_graph_optimize_reorder(std::vector<node_info> & nodes) {
++    // Tensor metadata is immutable during reordering. Resolve each node's
++    // ranges once, preserving source/fused-source/destination order.
++    std::vector<ggml_mem_range> ranges;
++    ranges.reserve(nodes.size() * 3);
++    const auto append_sources = [&ranges](const ggml_tensor * tensor) {
++        for (const auto * source : tensor->src) {
++            if (source) ranges.push_back(ggml_mem_range_from_tensor_src(source));
++        }
+     };
+-
+-    // helper to check if a node can run concurrently with the existing set of nodes
+-    const auto & h_check = [](ggml_mem_ranges_t mrs, const node_info & node) {
+-        for (int i = 0; i < GGML_MAX_SRC; i++) {
+-            if (node.node->src[i]) {
+-                if (!ggml_mem_ranges_check_src(mrs, node.node->src[i])) {
+-                    return false;
+-                }
+-            }
+-        }
+-
+-        for (const auto * fused : node.fused) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
+-                if (fused->src[i]) {
+-                    if (!ggml_mem_ranges_check_src(mrs, fused->src[i])) {
+-                        return false;
+-                    }
+-                }
+-            }
+-        }
+-
+-        return ggml_mem_ranges_check_dst(mrs, node.dst());
++    for (auto & node : nodes) {
++        node.range_begin = ranges.size();
++        append_sources(node.node);
++        for (const auto * fused : node.fused) append_sources(fused);
++        ranges.push_back(ggml_mem_range_from_tensor_dst(node.dst()));
++        node.range_end = ranges.size();
++    }
++
++    const auto h_add = [&ranges](node_range_set & set, const node_info & node) {
++        set.sources.ranges.insert(set.sources.ranges.end(), ranges.begin() + node.range_begin, ranges.begin() + node.range_end - 1);
++        set.destinations.ranges.push_back(ranges[node.range_end - 1]);
++    };
++
++    const auto h_check = [&ranges](node_range_set & set, const node_info & node) {
++        for (size_t i = node.range_begin; i < node.range_end - 1; ++i) {
++            if (!ggml_mem_ranges_check(&set.destinations, ranges[i])) return false;
++        }
++
++        const auto & destination = ranges[node.range_end - 1];
++        return ggml_mem_ranges_check(&set.destinations, destination) &&
++               ggml_mem_ranges_check(&set.sources, destination);
+     };
+ 
+     // perform reorders only across these types of ops
+@@ -297,11 +298,10 @@
+ 
+     std::vector<bool> used(n, false);
+ 
+-    // the memory ranges for the set of currently concurrent nodes
+-    ggml_mem_ranges_t mrs0 = ggml_mem_ranges_init(0);
++    node_range_set mrs0;
+ 
+     // the memory ranges for the set of nodes that haven't been processed yet, when looking forward for a node to reorder
+-    ggml_mem_ranges_t mrs1 = ggml_mem_ranges_init(0);
++    node_range_set mrs1;
+ 
+     for (int i0 = 0; i0 < n; i0++) {
+         if (used[i0]) {
+@@ -317,7 +317,7 @@
+         if (!node0.is_empty() && !h_check(mrs0, node0)) {
+             // this will hold the set of memory ranges from the nodes that haven't been processed yet
+             // if a node is not concurrent with this set, we cannot reorder it
+-            ggml_mem_ranges_reset(mrs1);
++            mrs1.reset();
+ 
+             // initialize it with the current node
+             h_add(mrs1, node0);
+@@ -355,8 +355,7 @@
+                 }
+             }
+ 
+-            // finalize the concurrent set and begin a new one
+-            ggml_mem_ranges_reset(mrs0);
++            mrs0.reset();
+         }
+ 
+         // expand the concurrent set with the current node
+@@ -366,10 +365,8 @@
+         }
+     }
+ 
+-    ggml_mem_ranges_free(mrs0);
+-    ggml_mem_ranges_free(mrs1);
+-
+     return res;
++
+ }
+ 
+ void ggml_graph_optimize(ggml_cgraph * gf) {
