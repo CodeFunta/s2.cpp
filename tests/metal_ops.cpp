@@ -172,6 +172,101 @@ static void swiglu_q8_regression(ggml_backend_t backend) {
     }
 }
 
+static void matvec_add_q8_regression(ggml_backend_t backend) {
+    constexpr int64_t k = 1024;
+    constexpr int64_t rows = 257;
+    for (int64_t ncols : {int64_t(1), int64_t(2)}) {
+        for (int scenario = 0; scenario < (ncols == 1 ? 5 : 1); ++scenario) {
+            const bool alias_residual = scenario == 1;
+            const bool alias_projection = scenario == 2;
+            const bool requested_projection = scenario == 3;
+            const bool additional_consumer = scenario == 4;
+            auto * ctx = ggml_init({1 << 24, nullptr, true});
+            if (!ctx) throw std::runtime_error("Q8 residual context allocation failed");
+
+            auto * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, rows);
+            auto * ref_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+            auto * candidate_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+            auto * ref_residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, ncols);
+            auto * candidate_residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, ncols);
+
+            auto * ref_projection = ggml_mul_mat(ctx, weights, ref_input);
+            auto * ref_sum = alias_residual
+                ? ggml_add(ctx, ref_residual, ref_projection)
+                : ggml_add(ctx, ref_projection, ref_residual);
+            auto * ref_consumer = additional_consumer ? ggml_scale(ctx, ref_projection, 0.5f) : nullptr;
+            ggml_set_output(ref_projection);
+            ggml_set_output(ref_sum);
+            if (ref_consumer) ggml_set_output(ref_consumer);
+
+            auto * candidate_projection = ggml_mul_mat(ctx, weights, candidate_input);
+            ggml_tensor * candidate_sum;
+            if (alias_residual) {
+                candidate_sum = ggml_add_inplace(ctx, candidate_residual, candidate_projection);
+            } else if (alias_projection) {
+                candidate_sum = ggml_add_inplace(ctx, candidate_projection, candidate_residual);
+            } else {
+                candidate_sum = ggml_add(ctx, candidate_projection, candidate_residual);
+            }
+            auto * candidate_consumer = additional_consumer ? ggml_scale(ctx, candidate_projection, 0.5f) : nullptr;
+            if (requested_projection) ggml_set_output(candidate_projection);
+            ggml_set_output(candidate_sum);
+            if (candidate_consumer) ggml_set_output(candidate_consumer);
+
+            auto * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, ref_sum);
+            if (ref_consumer) ggml_build_forward_expand(graph, ref_consumer);
+            ggml_build_forward_expand(graph, candidate_sum);
+            if (candidate_consumer) ggml_build_forward_expand(graph, candidate_consumer);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buffer) throw std::runtime_error("Q8 residual allocation failed");
+
+            std::vector<float> weight_values(k * rows), input(k * ncols), residual(rows * ncols);
+            for (size_t i = 0; i < weight_values.size(); ++i)
+                weight_values[i] = 0.08f * std::sin(float(i) * 0.017f) - 0.02f;
+            for (size_t i = 0; i < input.size(); ++i)
+                input[i] = 0.13f * std::cos(float(i) * 0.031f) + 0.04f;
+            for (size_t i = 0; i < residual.size(); ++i)
+                residual[i] = 0.19f * std::sin(float(i) * 0.043f) - 0.07f;
+            std::vector<uint8_t> quantized(ggml_nbytes(weights));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, weight_values.data(), quantized.data(), 0, rows, k, nullptr);
+            ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+            ggml_backend_tensor_set(ref_input, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(candidate_input, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(ref_residual, residual.data(), 0, residual.size() * sizeof(float));
+            ggml_backend_tensor_set(candidate_residual, residual.data(), 0, residual.size() * sizeof(float));
+
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("Q8 residual compute failed");
+
+            std::vector<float> expected(residual.size()), actual(residual.size());
+            ggml_backend_tensor_get(ref_sum, expected.data(), 0, expected.size() * sizeof(float));
+            ggml_backend_tensor_get(candidate_sum, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < expected.size(); ++i) {
+                if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) || actual[i] != expected[i])
+                    throw std::runtime_error("Q8 fused residual result differs from unfused reference");
+            }
+            if (requested_projection) {
+                std::vector<float> expected_projection(residual.size()), actual_projection(residual.size());
+                ggml_backend_tensor_get(ref_projection, expected_projection.data(), 0, expected_projection.size() * sizeof(float));
+                ggml_backend_tensor_get(candidate_projection, actual_projection.data(), 0, actual_projection.size() * sizeof(float));
+                if (expected_projection != actual_projection)
+                    throw std::runtime_error("requested Q8 projection output differs");
+            }
+            if (additional_consumer) {
+                std::vector<float> expected_consumer(residual.size()), actual_consumer(residual.size());
+                ggml_backend_tensor_get(ref_consumer, expected_consumer.data(), 0, expected_consumer.size() * sizeof(float));
+                ggml_backend_tensor_get(candidate_consumer, actual_consumer.data(), 0, actual_consumer.size() * sizeof(float));
+                if (expected_consumer != actual_consumer)
+                    throw std::runtime_error("additional Q8 projection consumer differs");
+            }
+
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+}
+
 static void optimizer_alias_ordering(ggml_backend_t backend) {
     auto cpu = ggml_backend_cpu_init();
     if (!cpu) throw std::runtime_error("CPU fallback initialization failed");
@@ -247,7 +342,8 @@ int main() {
         transpose_conv(backend,1536,8,16,8,type);
     }
     swiglu_q8_regression(backend);
+    matvec_add_q8_regression(backend);
     optimizer_alias_ordering(backend);
     ggml_backend_free(backend);
-    std::cout<<"Metal padding, convolution and Q8 SwiGLU parity passed\n";
+    std::cout<<"Metal padding, convolution and Q8 fusion parity passed\n";
 }
